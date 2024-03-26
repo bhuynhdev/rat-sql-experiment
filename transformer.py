@@ -1,10 +1,19 @@
-from math import sqrt
 import torch
 import torch.nn as nn
+import math
 import preprocess
+from typing import Union
+from preprocess import BLOCK_SIZE, TGT_SIZE, SRC_VOCAB_SIZE, TGT_VOCAB_SIZE
+from torch.nn import functional as F
 
 DROP_OUT = 0.2
-
+BATCH_SIZE = 64
+device = "cpu"
+if torch.backends.mps.is_available():
+    device = "mps"  # Apple Metal Performance Shader (M1 chip)
+if torch.cuda.is_available():
+    device = "cuda"
+DEVICE = device
 
 class SingleHeadAttention(nn.Module):
   def __init__(self, emb_size: int, head_size: int):
@@ -31,7 +40,7 @@ class SingleHeadAttention(nn.Module):
     # `q @ k.T` will produce the itcanitial affinity matrix, basically how strong each query relates to each key
     # dimension: (B, T, D) @ (B, D, T) = (B, T, T)
     # Note The original "Attention is all you need paper" also scales down the affinity scores by multiplying `sqrt(head_size)`
-    affinity = (query @ key.transpose(-2, -1)) * (sqrt(self.head_size))  # tranpose(-2, -1) avoid transposing the Batch dimension
+    affinity = (query @ key.transpose(-2, -1)) * (math.sqrt(self.head_size))  # tranpose(-2, -1) avoid transposing the Batch dimension
     if should_mask:
       affinity = affinity.masked_fill(self.tril_mask == 0, float("-inf"))
     weight = F.softmax(affinity, dim=-1) # (B, T, T)
@@ -84,12 +93,6 @@ class EncoderBlock(nn.Module):
     x = x + self.feed_forward(self.layer_norm2(x))
     return x
 
-
-import math
-import torch
-import torch.nn as nn
-from torch.nn import functional as F
-
 #  [markdown]
 # # Positional Encoding
 # Use the sine and cosine positional encoding scheme
@@ -103,13 +106,6 @@ def compute_pos_encoding(block_size: int, d_model: int):
   position_encodings[:, 0::2] = torch.sin(positions * div_terms)
   position_encodings[:, 1::2] = torch.cos(positions * div_terms)
   return position_encodings
-
-#  [markdown]
-# # Transformer
-
-
-src_vocab_size = len(src_vocab)
-tgt_vocab_size = len(tgt_vocab)
 
 class Transformer1(nn.Module):
   def __init__(self, emb_size: int = 256):
@@ -128,7 +124,7 @@ class Transformer1(nn.Module):
       nn.LayerNorm(emb_size)
     )
     # ENCODER COMPONENTS
-    self.encoder_token_emb = nn.Embedding(src_vocab_size, emb_size)
+    self.encoder_token_emb = nn.Embedding(SRC_VOCAB_SIZE, emb_size)
     # Position embedding table: Convert each token's position in its block to a position embedding
     # Since it is using the sine and cosine positional encoding scheme, it's actually static
     self.register_buffer("positional_embedding", compute_pos_encoding(BLOCK_SIZE, emb_size))
@@ -136,10 +132,10 @@ class Transformer1(nn.Module):
     # DECODER COMPONENTS
     self.decoder_hidden_state_size = 2 * emb_size
     # Embedding lookup table: Convert token_ids to that token's corresponding embeddings
-    self.decoder_token_emb = nn.Embedding(tgt_vocab_size, emb_size)
+    self.decoder_token_emb = nn.Embedding(TGT_VOCAB_SIZE, emb_size)
     # Target language modeling head: Transform back from the embedding dimension to the tgt_vocab_size dimension
     # So that we can get the distribution and know which target token to choose
-    self.tgt_lm_head = nn.Linear(self.decoder_hidden_state_size, tgt_vocab_size)
+    self.tgt_lm_head = nn.Linear(self.decoder_hidden_state_size, TGT_VOCAB_SIZE)
     # For the decoder, we try to replicate the RNN model to process sequences
     # decoder_hidden_state = sigmoid(W1 * context_matrix + W2 * prev_hidden_state + bias + W3 * decoder_input_tok_emb)
     # Thus we need 3 weights matrix for use in the decoder, to produce a new decoder_hidden_state
@@ -155,12 +151,13 @@ class Transformer1(nn.Module):
     x = self.encode(input_idx) # (B, T, E)
     # Average the last hidden state of the encoder as the context
     context_emb = torch.mean(x, dim=1) # (B, E)
-    # Feed the <START> token as the chosen token to the entire batch
-    chosen_tokens = torch.tensor(toks_encode(["<START>"] * x.size(0), "target"), device=DEVICE) # (B)
+    # Feed the <START> token as the first chosen token to the entire batch
+    # The <START> token has index 1
+    chosen_tokens = torch.ones(x.size(0), device=DEVICE) # (B)
     ys: list[torch.Tensor] = []
     # Initialize the first hidden state as 0s
     hidden_state = torch.zeros((BATCH_SIZE, self.decoder_hidden_state_size), device=DEVICE) # (B, H) where H = dec_hidden_state
-    for _ in range(max_len_target):
+    for _ in range(TGT_SIZE):
       # hidden_state: (B, H)
       # tgt_probs: (B, C) where C = tgt_vocab_size
       hidden_state, tgt_probs = self.decode(context_emb, chosen_tokens, hidden_state)
@@ -170,7 +167,7 @@ class Transformer1(nn.Module):
 
     # Note that ys is collected by looping over max_len_target, so when stacked, the first dimension is max_len_target
     y = torch.stack(ys) # (T, B, C) where C = tgt_vocab_size
-    assert y.shape == (max_len_target, BATCH_SIZE, tgt_vocab_size)
+    assert y.shape == (TGT_SIZE, BATCH_SIZE, TGT_VOCAB_SIZE)
     if target_idx is None:
       return ys, None
     # Cross_entropy requires the "Class" dimension to be the 2nd dimension
@@ -179,7 +176,7 @@ class Transformer1(nn.Module):
     target_idx = target_idx.view(B*T)
     print(target_idx)
     # Calculate loss
-    loss = F.cross_entropy(y, target_idx, ignore_index=toks_encode([PAD_TOKEN], "target")[0])
+    loss = F.cross_entropy(y, target_idx, ignore_index=0)
     return ys, loss
 
   def encode(self, input_batch: torch.Tensor):
@@ -219,7 +216,9 @@ class Transformer1(nn.Module):
       encoder_last_hidden_state = self.encode(input_idx) # (B, T, E)
       # Average all input tokens embs across the encoder last hidden state as the context
       context_emb = torch.mean(encoder_last_hidden_state, dim=1) # (B, E)
-      chosen_tokens = torch.tensor(toks_encode(["<START>" for _ in range(BATCH_SIZE)], "target"), device=DEVICE) # (B)
+      # Feed the <START> token as the first chosen token to the entire batch
+      # The <START> token has index 1
+      chosen_tokens = torch.ones(input_idx.size(0), device=DEVICE) # (B)
       first_batch_predicted_tokens: list[int] = []
       # Initialize the first hidden state as 0s
       hidden_state = torch.zeros((BATCH_SIZE, self.decoder_hidden_state_size), device=DEVICE) # (B, H) where H = dec_hidden_state
@@ -233,3 +232,9 @@ class Transformer1(nn.Module):
         chosen_token = chosen_tokens[0].item() # View result of only the first batch
         first_batch_predicted_tokens.append(int(chosen_token))
     return first_batch_predicted_tokens
+  
+def main():
+  pass
+
+if __name__ == "__main__":
+  main()
