@@ -2,8 +2,8 @@ import torch
 import torch.nn as nn
 import math
 import preprocess
-from typing import Union
-from preprocess import BLOCK_SIZE, TGT_SIZE, SRC_VOCAB_SIZE, TGT_VOCAB_SIZE
+from typing import Iterable, Iterator, Union, cast
+from preprocess import BLOCK_SIZE, TGT_SIZE, SRC_VOCAB_SIZE, TGT_VOCAB_SIZE, ModelInput
 from torch.nn import functional as F
 
 DROP_OUT = 0.2
@@ -153,17 +153,21 @@ class Transformer1(nn.Module):
     context_emb = torch.mean(x, dim=1) # (B, E)
     # Feed the <START> token as the first chosen token to the entire batch
     # The <START> token has index 1
-    chosen_tokens = torch.ones(x.size(0), device=DEVICE) # (B)
+    chosen_tokens = torch.ones(x.size(0), device=DEVICE, dtype=torch.int) # (B)
     ys: list[torch.Tensor] = []
     # Initialize the first hidden state as 0s
     hidden_state = torch.zeros((BATCH_SIZE, self.decoder_hidden_state_size), device=DEVICE) # (B, H) where H = dec_hidden_state
-    for _ in range(TGT_SIZE):
+    for i in range(TGT_SIZE):
       # hidden_state: (B, H)
       # tgt_probs: (B, C) where C = tgt_vocab_size
       hidden_state, tgt_probs = self.decode(context_emb, chosen_tokens, hidden_state)
-      # Greedily select the token with highest prob from the distribution
-      chosen_tokens = torch.argmax(tgt_probs, dim=1) # (B)
       ys.append(tgt_probs)
+      if target_idx is not None:
+        # Teacher forcing
+        chosen_tokens = target_idx[:, i]
+      else:
+        # Greedily select the token with highest prob from the distribution
+        chosen_tokens = torch.argmax(tgt_probs, dim=1) # (B)
 
     # Note that ys is collected by looping over max_len_target, so when stacked, the first dimension is max_len_target
     y = torch.stack(ys) # (T, B, C) where C = tgt_vocab_size
@@ -177,7 +181,7 @@ class Transformer1(nn.Module):
     print(target_idx)
     # Calculate loss
     loss = F.cross_entropy(y, target_idx, ignore_index=0)
-    return ys, loss
+    return y, loss
 
   def encode(self, input_batch: torch.Tensor):
     # Input batch is of shape (B, T) (i.e. (batch size, block_size))
@@ -218,7 +222,7 @@ class Transformer1(nn.Module):
       context_emb = torch.mean(encoder_last_hidden_state, dim=1) # (B, E)
       # Feed the <START> token as the first chosen token to the entire batch
       # The <START> token has index 1
-      chosen_tokens = torch.ones(input_idx.size(0), device=DEVICE) # (B)
+      chosen_tokens = torch.ones(input_idx.size(0), device=DEVICE, dtype=torch.int) # (B)
       first_batch_predicted_tokens: list[int] = []
       # Initialize the first hidden state as 0s
       hidden_state = torch.zeros((BATCH_SIZE, self.decoder_hidden_state_size), device=DEVICE) # (B, H) where H = dec_hidden_state
@@ -234,7 +238,67 @@ class Transformer1(nn.Module):
     return first_batch_predicted_tokens
   
 def main():
-  pass
+  # Train
+  m1 = Transformer1()
+  m1 = m1.to(DEVICE)
+
+  print("BOOTSTRAPPING THE DATALOADER")
+  _, _, train_dataloader, _, token_lookup_tables = preprocess.everything()
+
+  m1.eval()
+  train_dataloader_iter = cast(Iterator[ModelInput], iter(train_dataloader))
+  batch = next(train_dataloader_iter)
+
+  input = batch[0] # (B, block_size)
+  print("SAMPLE GENERATING")
+  print('Sample input', preprocess.toks_decode(input.tolist()[0], token_lookup_tables, "source"))
+  first_batch_predicted_tokens = m1.generate(input)
+  predicted = preprocess.toks_decode(first_batch_predicted_tokens, token_lookup_tables, "target")
+  print(predicted)
+
+  # Train the network
+  # Create an optimizer
+  m1.train()
+  optimizer = torch.optim.AdamW(m1.parameters(), lr=5e-5)
+
+  print("START TRAINING")
+
+  for epoch in range(30):
+    try:
+      batch = next(train_dataloader_iter)
+    except StopIteration:
+      # Reset the dataloader
+      train_dataloader_iter = iter(train_dataloader)
+      batch = next(train_dataloader_iter)
+    input = batch[0] # (B, block_size)
+    target = batch[1] # (B, TGT_SIZE)
+    _, loss = m1(input, target)
+    optimizer.zero_grad(set_to_none=True)
+    loss.backward()
+    optimizer.step()
+    print(epoch, loss)
+
+  #After training
+  # Save the model
+  torch.save(m1.state_dict(), "transform2.pt")
+
+  # Inference
+  m1_trained = Transformer1()
+  m1_trained.load_state_dict(torch.load("transform2.pt"))
+  m1_trained = m1_trained.to(DEVICE)
+  m1_trained.eval()
+
+  x_batch = next(train_dataloader_iter)
+
+  input = torch.cat((x_batch[0], x_batch[1], x_batch[2]), dim=1) # (B, block_size)
+  target = x_batch[3].tolist()[0]
+  print('Target tokens', target)
+  print('Target words', preprocess.toks_decode(target, token_lookup_tables, "target"))
+
+  y_batch = m1_trained.generate(input, max_generated_tokens=TGT_SIZE)
+  print('Inference input words', preprocess.toks_decode(input.tolist()[0], token_lookup_tables, "source"))
+  print('Inferece output tokens', y_batch)
+  print('Inference output words', preprocess.toks_decode(y_batch, token_lookup_tables, "target"))
 
 if __name__ == "__main__":
   main()

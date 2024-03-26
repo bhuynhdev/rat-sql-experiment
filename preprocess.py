@@ -390,21 +390,25 @@ class MyDataset(Dataset[DatasetItem]):
             columns_tokens, columns_types, tables_tokens, question_tokens
         )
         return DatasetItem(
-            colname_tokIds=torch.tensor(
+            colname_tokIds = torch.tensor(
                 toks_encode(input_parts[0], self.token_lookup_tables, "source"),
                 device=DEVICE,
+                dtype=torch.int,
             ),
-            tblname_tokIds=torch.tensor(
+            tblname_tokIds = torch.tensor(
                 toks_encode(input_parts[1], self.token_lookup_tables, "source"),
                 device=DEVICE,
+                dtype=torch.int,
             ),
             ques_tokIds=torch.tensor(
                 toks_encode(input_parts[2], self.token_lookup_tables, "source"),
                 device=DEVICE,
+                dtype=torch.int,
             ),
             target_tokIds=torch.tensor(
                 toks_encode(target_tokens, self.token_lookup_tables, "target"),
                 device=DEVICE,
+                dtype=torch.int,
             ),
         )
 
@@ -524,7 +528,7 @@ def everything():
     train_dataloader, val_dataloader = create_dataloaders(
         train_dataset, val_dataset, batch_size=64, num_workers=4
     )
-    return (train_dataset, val_dataset, train_dataloader, val_dataloader)
+    return (train_dataset, val_dataset, train_dataloader, val_dataloader, token_lookup_tables)
 
 
 if __name__ == "__main__":
