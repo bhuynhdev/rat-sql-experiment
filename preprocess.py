@@ -1,9 +1,13 @@
 import spacy
 import torch
-from torch import nn
 import json
 from dataclasses import dataclass, field
-from typing import Literal, Any, NamedTuple
+from typing import Literal, Any, NamedTuple, Callable
+from torch.utils.data import Dataset, DataLoader
+from torch.nn.utils.rnn import pad_sequence
+import os
+import gdown
+
 # Prepare Stanford's Stanza to tokenize the columns and tables names
 # stanza.download('en')
 # stanza_nlp = stanza.Pipeline(processors='tokenize,mwt,pos,lemma', lang='en')
@@ -235,13 +239,19 @@ class TokenLookupTables(NamedTuple):
   tgt_idx_to_tok: dict[int, str]
 
 
-def create_token_lookup_tables(src_vocab: set[str], tgt_vocab: set[str])
+def create_token_lookup_tables(src_vocab: set[str], tgt_vocab: set[str]):
   # Token to id: Assign a number to each token in the vocab
   # Id to token: Retrieve the token give the index
-  src_tok_to_idx = { tok: i for i, tok in enumerate(sorted(list(src_vocab))) }
-  src_idx_to_tok = { i: tok for i, tok in enumerate(sorted(list(src_vocab))) }
-  tgt_tok_to_idx = { tok: i for i, tok in enumerate(sorted(list(tgt_vocab))) }
-  tgt_idx_to_tok = { i: tok for i, tok in enumerate(sorted(list(tgt_vocab))) }
+
+  # Note that we intend to assign the PAD token to index 0, so we start enumerating from index 1
+  src_tok_to_idx = { tok: i for i, tok in enumerate(sorted(list(src_vocab)), start=1) if tok != PAD_TOKEN }
+  src_tok_to_idx[PAD_TOKEN] = 0
+  src_idx_to_tok = { i: tok for i, tok in enumerate(sorted(list(src_vocab)), start=1) if tok != PAD_TOKEN }
+  src_idx_to_tok[0] = PAD_TOKEN
+  tgt_tok_to_idx = { tok: i for i, tok in enumerate(sorted(list(tgt_vocab)), start=1) if tok != PAD_TOKEN }
+  tgt_tok_to_idx[PAD_TOKEN] = 0
+  tgt_idx_to_tok = { i: tok for i, tok in enumerate(sorted(list(tgt_vocab)), start=1) if tok != PAD_TOKEN }
+  tgt_idx_to_tok[0] = PAD_TOKEN
 
   return TokenLookupTables(src_tok_to_idx, src_idx_to_tok, tgt_tok_to_idx, tgt_idx_to_tok)
 
@@ -266,7 +276,168 @@ def create_tokens_encode_decode_functions(token_lookup_tables: TokenLookupTables
 
   return toks_encode, toks_decode
 
-BLOCK_SIZE = max_len_col_name_part + max_len_tbl_name_part + max_len_ques_part
+# Each dataset item is 4-element tuple:
+# First 3 elements are indexes of the tokens each part of the input seq (col name, table name, ques)
+# Last element are indexes of the tokens of the target seq
+class DatasetItem(NamedTuple):
+  colname_tokIds: list[int]
+  tblname_tokIds: list[int]
+  ques_tokIds: list[int]
+  target_tokIds: list[int]
+
+class MyDataset(Dataset[DatasetItem]):
+    """Each element in this dataset is a 4-element tuple
+    (col_name_toks, table_name_toks, question_toks, target_toks)
+
+    where `col_name_toks`, `table_name_toks`, `question_toks` has been preprocessed to add "CLS" separator token
+    and `target_toks` is also processed to include <Start> and <End> tokens
+    """
+    def __init__(self, all_items: list[SpiderItem], toks_encode: Callable[[list[str], Literal["source", "target"]], list[int]]):
+        self.items = all_items
+        self.toks_encode = toks_encode
+
+    def __len__(self):
+        return len(self.items)
+    
+      # Create the dataset and dataloader
+    def construct_input_block_toks(
+        self,
+        col_toks: list[list[str]],
+        col_types: list[ColumnType],
+        table_toks: list[list[str]],
+        ques_toks: list[str],
+    ):
+        """Construct and return the 3 components of an input block as a tuple of the list of tokens
+        An input block has 3 parts:
+          The col name part: `CLS col_type ...col_name CLS col_type2 ...Col_name2`
+          The table name part: `CLS ...tbl_name CLS ...tbl_name2`
+          The question part: ` CLS ...question`
+
+        Parameters:
+          col_toks: nested list of all tokens across all column names, each element is a list of tokens that belongs in one column name
+          tbl_toks: nested list of all tokens across all table names, each element is a list of tokens that belongs in one table name
+
+        Returns:
+          a 3-elemment tuple containing (col_name_part, tbl_name_part, ques_part) w/ each part being the list of tokens including the 'CLS' token
+        """
+        # List of column types should match length with list of columns
+        assert len(col_toks) == len(col_types)
+        # Construct the col name part, thus producing something like:
+        # "CLS number builing size CLS text building name..."
+        col_name_part: list[str] = []
+        for col_name_toks, col_type in zip(col_toks, col_types):
+            col_name_part.extend(["CLS", col_type] + col_name_toks)
+        # Construct the col name part, thus producing something like:
+        # "CLS building information CLS city information ...etc"
+        tbl_name_part: list[str] = []
+        for tbl_name_toks in table_toks:
+            tbl_name_part.extend(["CLS"] + tbl_name_toks)
+        # Construct the question part, thus producing something like:
+        # "CLS what is the highest building in Chicago"
+        question_part: list[str] = ques_toks
+        return (col_name_part, tbl_name_part, question_part)
+
+    def __getitem__(self, idx: int):
+        item = self.items[idx]
+        columns_tokens = [c.name_toks for c in item.db.columns[1:]] # Skip the 0th-index "*" column
+        columns_types: list[ColumnType] = [c.col_type for c in item.db.columns[1:]]
+        tables_tokens = [t.name_toks for t in item.db.tables]
+        question_tokens = item.qa_pair.question_toks
+        target_tokens = item.qa_pair.query_toks + ["<END>"]
+
+        input_parts = self.construct_input_block_toks(columns_tokens, columns_types, tables_tokens, question_tokens)
+        return DatasetItem(
+          colname_tokIds=self.toks_encode(input_parts[0], "source"),
+          tblname_tokIds=self.toks_encode(input_parts[1], "source"),
+          ques_tokIds=self.toks_encode(input_parts[2], "source"),
+          target_tokIds=self.toks_encode(target_tokens, "target")
+        )
+    
+def get_block_size_and_tgt_size(train_dataset: MyDataset, val_dataset: MyDataset):
+  # Find the max_length of each "category" across the datasets
+  # Category here correspondings to the 4 categories (col_name_toks, table_name_toks, question_toks, target_toks)
+  max_lengths_train = [max(len(category) for category in item) for item in zip(*train_dataset)]
+  max_lengths_val = [max(len(category) for category in item) for item in zip(*train_dataset)]
+  max_lengths_overall = [max(category_train, category_val) for (category_train, category_val) in zip(max_lengths_train, max_lengths_val)]
+
+  max_len_col_name_part = max_lengths_overall[0]
+  max_len_tbl_name_part = max_lengths_overall[1]
+  max_len_ques_part = max_lengths_overall[2]
+  max_len_target = max_lengths_overall[3]
+  block_size = max_len_col_name_part + max_len_tbl_name_part + max_len_ques_part
+  target_size = max_len_target
+  return block_size, target_size
+
+ModelInput = tuple[torch.Tensor, torch.Tensor]
+
+def pad_collate(batch: list[tuple[list[str], list[str], list[str], list[str]]]) -> ModelInput:
+  """The collate_fn to pass to Pytorch Dataloader.
+  Pad each element in the dataset so they all have the same size"""
+  batched_colname_tokIds, batched_tblname_tokIds, batched_ques_tokIds, batched_target_tokIds = zip(*batch)
+  block_size, tgt_size = get_block_size_and_tgt_size(train_dataset, val_dataset)
+
+  batched_input_tokIds = [torch.cat((colname, tblname, ques)) for colname, tblname, ques in zip(batched_colname_tokIds, batched_tblname_tokIds, batched_ques_tokIds)]
+
+  # Now pad this batch so that every item of the batch is same size as a local longest item
+  # From the doc: `pad_sequence` stacks a list of Tensors along a new dimension, and pads them to equal length.
+  # Use 0 as padding_value since 0 is the index of the PAD_TOKEN
+  batched_input_tokIds = pad_sequence(batched_input_tokIds, batch_first=True, padding_value=0)
+  # Now pad this batch again so that every item of the batch is same size of the global longest item (max_len_col_name_part)
+  batched_input_tokIds= torch.nn.functional.pad(
+      batched_input_tokIds, (0, block_size - batched_input_tokIds.size(1)), value=0) 
+  # After padding, each tensor should be dimension (B, T)
+  # With B being the batch dimension (since we use batch_first=True) and T is max_len_col_name_part
+
+  # Note that for the target, we need use `tgt_tok_to_idx`
+  batched_tgt_tokIds = pad_sequence(batched_target_tokIds, batch_first=True, padding_value=0)
+  batched_tgt_tokIds = torch.nn.functional.pad(
+      batched_tgt_tokIds, (0, tgt_size - batched_tgt_tokIds.size(1)), value=0)
+  batched_tgt_tokIds = batched_tgt_tokIds
+
+  return (batched_input_tokIds, batched_tgt_tokIds)
+
+def create_dataloaders(train_dataset: Dataset[DatasetItem], val_dataset: Dataset[DatasetItem], toks_encode: Callable[[list[str], Literal["source", "target"]], list[int]], batch_size: int = 64, num_workers:int = 4):
+  train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, drop_last=True, num_workers=num_workers, collate_fn=create_pad_collate_func(toks_encode, batch_size))
+  val_dataloader = DataLoader(val_dataset, batch_size=batch_size, shuffle=True, drop_last=True, num_workers=num_workers, collate_fn=create_pad_collate_func(toks_enc, batch_size))
+  return (train_dataloader, val_dataloader)
+
+def everything():
+  schema_lookup = create_database_schemas("spider/tables.json")
+  train_qas, val_qas, train_items, val_items = create_training_items("spider/train_spider.json", "spider/dev.json", schema_lookup)
+  train_dataset = create_dataset(train_items)
+  val_dataset = create_dataset(val_items)
+  src_vocab, tgt_vocab = create_vocabs(schema_lookup, train_qas, val_qas)
+  token_lookup_tables = create_token_lookup_tables(src_vocab, tgt_vocab)
+  toks_enc, _ = create_tokens_encode_decode_functions(token_lookup_tables)
+  train_dataloader, val_dataloader = create_dataloaders(train_dataset, val_dataset, batch_size=64, num_workers=4, toks_encode=toks_enc)
+  return train_dataloader, val_dataloader
+
+if __name__ == "__main__":
+  spider_url = 'https://drive.google.com/u/0/uc?id=1iRDVHLr4mX2wQKSgA9J8Pire73Jahh0m&export=download' # https://yale-lily.github.io/spider
+  output = 'spider.zip'
+  if not os.path.exists(output):
+    gdown.download(spider_url, output, quiet=False)
+
+  if not os.path.exists(output.removesuffix(".zip")):
+    raise Exception("'spider' folder not found")
+  
+  schema_lookup = create_database_schemas("spider/tables.json")
+  train_qas, val_qas, train_items, val_items = create_training_items("spider/train_spider.json", "spider/dev.json", schema_lookup)
+  train_dataset = create_dataset(train_items)
+  val_dataset = create_dataset(val_items)
+  src_vocab, tgt_vocab = create_vocabs(schema_lookup, train_qas, val_qas)
+  token_lookup_tables = create_token_lookup_tables(src_vocab, tgt_vocab)
+  toks_enc, toks_dec = create_tokens_encode_decode_functions(token_lookup_tables)
+  train_dataloader, val_dataloader = create_dataloaders(train_dataset, val_dataset, batch_size=64, num_workers=4, toks_encode=toks_enc)
+
+  with open("temptemp1.txt", "w") as f:
+    for i in range(len(train_dataset)):
+      f.write(f"{train_dataset[i]}\n\n")
+
+  with open("temptemp2.txt", "w") as f:
+    for i, batch in enumerate(train_dataloader):
+      f.write(f"{i}\n")
+      f.write(f"{batch[0]} {batch[1]}\n")
 
 
 
