@@ -3,3 +3,4 @@ spider
 spider.zip
 __MACOSX
 __pycache__
+*.pt
