@@ -3,7 +3,7 @@ import torch.nn as nn
 import math
 import preprocess
 from typing import Iterator, Union, cast
-from preprocess import BLOCK_SIZE, TGT_SIZE, SRC_VOCAB_SIZE, TGT_VOCAB_SIZE, ModelInput
+from preprocess import BLOCK_SIZE, TGT_SIZE, SRC_VOCAB_SIZE, TGT_VOCAB_SIZE, DatasetItem
 from torch.nn import functional as F
 
 DROP_OUT = 0.2
@@ -247,7 +247,7 @@ class Transformer1(nn.Module):
       # Feed the <START> token as the first chosen token to the entire batch
       # The <START> token has index 1
       chosen_tokens = torch.ones(input_idx.size(0), device=DEVICE, dtype=torch.int64)  # (B)
-      first_batch_predicted_tokens: list[int] = []
+      predicted_tokens: list[list[int]] = [list() for _ in range(BATCH_SIZE)] # Predicted token across the batches
       # Initialize the first hidden state as 0s
       hidden_state = torch.zeros((BATCH_SIZE, self.decoder_hidden_state_size), device=DEVICE)  # (B, H) where H = dec_hidden_state
       for _ in range(max_generated_tokens):
@@ -256,10 +256,9 @@ class Transformer1(nn.Module):
         hidden_state, tgt_probs = self.decode(context_emb, chosen_tokens, prev_hidden_state=hidden_state)
         # Greedily select the token with highest prob from the distribution
         chosen_tokens = torch.argmax(tgt_probs, dim=1)  # (B)
-        # print(chosen_tokens)
-        chosen_token = chosen_tokens[0].item()  # View result of only the first batch
-        first_batch_predicted_tokens.append(int(chosen_token))
-    return first_batch_predicted_tokens
+        for i, chosen_token in enumerate(chosen_tokens):
+          predicted_tokens[i].append(int(chosen_token.item()))
+    return predicted_tokens
 
 
 def main():
@@ -271,7 +270,7 @@ def main():
   _, _, train_dataloader, _, token_lookup_tables = preprocess.everything()
 
   # # m1.eval()
-  train_dataloader_iter = cast(Iterator[ModelInput], iter(train_dataloader))
+  train_dataloader_iter = cast(Iterator[DatasetItem], iter(train_dataloader))
   # batch = next(train_dataloader_iter)
 
   # input, target = batch # (B, block_size)
@@ -317,15 +316,15 @@ def main():
 
   batch = next(train_dataloader_iter)
 
-  input = batch[0]
-  target = batch[1]
-  print("Inference: Input words", preprocess.toks_decode(input.tolist()[0], token_lookup_tables, "source"))
-  print("Inference: Target tokens", target.tolist()[0])
-  print("Inference: Target words", preprocess.toks_decode(target.tolist()[0], token_lookup_tables, "target"))
+  input_seq, target_seq = batch
+  print("Inference: Input words", preprocess.toks_decode(input_seq.tolist()[0], token_lookup_tables, "source"))
+  print("Inference: Target tokens", target_seq.tolist()[0])
+  print("Inference: Target words", preprocess.toks_decode(target_seq.tolist()[0], token_lookup_tables, "target"))
 
-  y_batch = m1_trained.generate(input.to(DEVICE), max_generated_tokens=TGT_SIZE)
-  print("Inference: Output tokens", y_batch)
-  print("Inference: Output words", preprocess.toks_decode(y_batch, token_lookup_tables, "target"))
+  y_batch = m1_trained.generate(input_seq.to(DEVICE), max_generated_tokens=TGT_SIZE)
+  for y in y_batch:
+    print("Inference: Output tokens", y)
+    print("Inference: Output words", preprocess.toks_decode(y, token_lookup_tables, "target"))
 
 
 if __name__ == "__main__":
