@@ -336,8 +336,8 @@ class MyDataset(Dataset[DatasetItem]):
       self.block_size = max(self.block_size, len(input_parts_concat))
       self.target_size = max(self.target_size, len(target_tokens))
       # Convert to tensors
-      input_sequence = torch.tensor(toks_encode(input_parts_concat, self.token_lookup_tables, "source"), dtype=torch.int)
-      target_sequence = torch.tensor(toks_encode(target_tokens, self.token_lookup_tables, "target"), dtype=torch.int)
+      input_sequence = torch.tensor(toks_encode(input_parts_concat, self.token_lookup_tables, "source"), dtype=torch.int64)
+      target_sequence = torch.tensor(toks_encode(target_tokens, self.token_lookup_tables, "target"), dtype=torch.int64)
       # Pad the sequences so they matches the max length
       input_sequence = torch.nn.functional.pad(input_sequence, (0, BLOCK_SIZE - input_sequence.size(0)), value=0)
       target_sequence = torch.nn.functional.pad(target_sequence, (0, TGT_SIZE - target_sequence.size(0)), value=0)
