@@ -63,7 +63,7 @@ def create_database_schemas(tables_file_path: str):
   # Prepare spacy to tokenize and lemmatize the table names and columns names
   spacy_nlp = spacy.load("en_core_web_sm", disable=["ner", "textcat", "parser"])
   # Fix the "Spacy breaks up 'id' into 'i' and 'd' issue" https://github.com/explosion/spaCy/discussions/10570
-  spacy_nlp.tokenizer.rules = {key: value for key, value in spacy_nlp.tokenizer.rules.items() if key != "id"}
+  spacy_nlp.tokenizer.rules = {key: value for key, value in spacy_nlp.tokenizer.rules.items() if key != "id"} # type: ignore
 
   for _, db_info in enumerate(raw_schema_data):
     db_id = db_info["db_id"]

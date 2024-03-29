@@ -1,4 +1,3 @@
-import json
 import math
 from typing import Iterator, cast
 
@@ -325,11 +324,11 @@ def main():
   # Train the network
   # Create an optimizer
   # m1.train()
-  # optimizer = torch.optim.AdamW(m1.parameters(), lr=5e-4)
+  # optimizer = torch.optim.AdamW(m1.parameters(), lr=5e-5)
 
   # print("START TRAINING")
 
-  # for epoch in range(45):
+  # for epoch in range(108):
   #   try:
   #     batch = next(train_dataloader_iter)
   #   except StopIteration:
@@ -344,9 +343,10 @@ def main():
   #   optimizer.step()
   #   print(epoch, loss)
 
-  # After training
-  # Save the model
-  # torch.save(m1.state_dict(), f"{MODEL_NAME}.pt")
+  # # After training
+  # # Save the model
+  # print("TRAINIG FINISHED. SAVING THE MODEL")
+  # torch.save(m1.state_dict(), f"{MODEL_NAME}.pt") # pyright: ignore[reportUnknownMemberType]
 
   # Inference
   m1_trained = Transformer1()
@@ -359,8 +359,8 @@ def main():
   input_seq, target_seq = batch
   y_batch = m1_trained.generate(input_seq.to(DEVICE), max_generated_tokens=TGT_SIZE)
 
-  # Print result to cmd (just first 5 batch)
-  for i in range(5):
+  # Print result to cmd (just first 2 batch)
+  for i in range(2):
     print("Inference: Input words", preprocess.toks_decode(input_seq.tolist()[i], token_lookup_tables, "source")) # type: ignore
     print("Inference: Target tokens", target_seq.tolist()[i])  # type: ignore
     print("Inference: Target words", preprocess.toks_decode(target_seq.tolist()[i], token_lookup_tables, "target"))  # type: ignore
@@ -372,7 +372,7 @@ def main():
     for i in range(BATCH_SIZE):
       f.write(f"{i}\n")
       f.write(f"input_words: {preprocess.toks_decode(input_seq[i, :].tolist(), token_lookup_tables, "source")}\n") # type: ignore
-      f.write(f"target_wrods: {preprocess.toks_decode(target_seq[i, :].tolist(), token_lookup_tables, "target")}\n") # type: ignore
+      f.write(f"target_words: {preprocess.toks_decode(target_seq[i, :].tolist(), token_lookup_tables, "target")}\n") # type: ignore
       f.write(f"target_tokens: {target_seq[i, :].tolist()}\n") # type: ignore
       f.write(f"predicted_words: {preprocess.toks_decode(y_batch[i], token_lookup_tables, "target")}\n") # type: ignore
       f.write(f"predicted_tokens: {y_batch[i]}\n")
