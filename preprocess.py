@@ -11,6 +11,7 @@ import gdown
 # stanza.download('en')
 # stanza_nlp = stanza.Pipeline(processors='tokenize,mwt,pos,lemma', lang='en')
 
+BATCH_SIZE = 16
 
 ColumnType = Literal["time", "text", "number", "boolean", "others"]
 
@@ -368,7 +369,7 @@ SRC_VOCAB_SIZE = 4195
 TGT_VOCAB_SIZE = 5471
 
 
-def create_dataloaders(train_dataset: Dataset[DatasetItem], val_dataset: Dataset[DatasetItem], batch_size: int = 64, num_workers: int = 4):
+def create_dataloaders(train_dataset: Dataset[DatasetItem], val_dataset: Dataset[DatasetItem], batch_size: int, num_workers: int = 4):
   train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, drop_last=True, num_workers=num_workers, pin_memory=True)
   val_dataloader = DataLoader(val_dataset, batch_size=batch_size, shuffle=True, drop_last=True, num_workers=num_workers, pin_memory=True)
   return (train_dataloader, val_dataloader)
@@ -381,12 +382,10 @@ def everything():
       "spider/train_spider.json", "spider/dev.json", schema_lookup
   )
   src_vocab, tgt_vocab = create_vocabs(schema_lookup, train_qas, val_qas)
-  print(len(src_vocab))
-  print(len(tgt_vocab))
   token_lookup_tables = create_token_lookup_tables(src_vocab, tgt_vocab)
   train_dataset = MyDataset(train_items, token_lookup_tables)
   val_dataset = MyDataset(val_items, token_lookup_tables)
-  train_dataloader, val_dataloader = create_dataloaders(train_dataset, val_dataset, batch_size=64, num_workers=4)
+  train_dataloader, val_dataloader = create_dataloaders(train_dataset, val_dataset, batch_size=BATCH_SIZE, num_workers=4)
   return (train_dataset, val_dataset, train_dataloader, val_dataloader, token_lookup_tables)
 
 

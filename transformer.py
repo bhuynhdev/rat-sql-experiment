@@ -6,11 +6,10 @@ import torch.nn as nn
 from torch.nn import functional as F
 
 import preprocess
-from preprocess import BLOCK_SIZE, SRC_VOCAB_SIZE, TGT_SIZE, TGT_VOCAB_SIZE, DatasetItem
+from preprocess import BLOCK_SIZE, SRC_VOCAB_SIZE, TGT_SIZE, TGT_VOCAB_SIZE, BATCH_SIZE, DatasetItem
 from util import UnpackedSequential
 
 DROP_OUT = 0.2
-BATCH_SIZE = 64
 device = "cpu"
 if torch.backends.mps.is_available():
   device = "mps"  # Apple Metal Performance Shader (M1 chip)
@@ -257,7 +256,7 @@ class Transformer1(nn.Module):
     # the position_embedding_table takes input the position of each token in the sequence (i.e. the T dimension)
     position_emb = self.positional_embedding_src  # (T, E)
     x = token_emb + position_emb  # (B, T, E)
-    assert x.shape == (BATCH_SIZE, BLOCK_SIZE, self.emb_size)
+    assert x.shape == (BATCH_SIZE, BLOCK_SIZE, self.emb_size), f"Expected {(BATCH_SIZE, BLOCK_SIZE, self.emb_size)}. Got {x.shape}"
     # Feed this x through layers of Transformer Self-Attention blocks
     x = self.encoder_layers(x)
     return x
@@ -301,6 +300,7 @@ class Transformer1(nn.Module):
 def main():
   # # Train
   m1 = Transformer1()
+  print(f"Parameter count: {sum(dict((p.data_ptr(), p.numel()) for p in m1.parameters()).values())}") # https://stackoverflow.com/a/62764464
   m1 = m1.to(DEVICE)
 
   print("BOOTSTRAPPING THE DATALOADER")
@@ -320,33 +320,33 @@ def main():
   print(predicted)
 
   MODEL_NAME = "transform3"
-
+  
+  
+  print("START TRAINING")
   # Train the network
   # Create an optimizer
-  # m1.train()
-  # optimizer = torch.optim.AdamW(m1.parameters(), lr=5e-5)
+  m1.train()
+  optimizer = torch.optim.AdamW(m1.parameters(), lr=5e-5)
 
-  # print("START TRAINING")
+  for epoch in range(20000):
+    try:
+      batch = next(train_dataloader_iter)
+    except StopIteration:
+      # Reset the dataloader
+      train_dataloader_iter = iter(train_dataloader)
+      batch = next(train_dataloader_iter)
+    input = batch[0].to(DEVICE)  # (B, block_size)
+    target = batch[1].to(DEVICE)  # (B, TGT_SIZE)
+    _, loss = m1(input, target)
+    optimizer.zero_grad(set_to_none=True)
+    loss.backward()
+    optimizer.step()
+    print(epoch, loss)
 
-  # for epoch in range(108):
-  #   try:
-  #     batch = next(train_dataloader_iter)
-  #   except StopIteration:
-  #     # Reset the dataloader
-  #     train_dataloader_iter = iter(train_dataloader)
-  #     batch = next(train_dataloader_iter)
-  #   input = batch[0].to(DEVICE)  # (B, block_size)
-  #   target = batch[1].to(DEVICE)  # (B, TGT_SIZE)
-  #   _, loss = m1(input, target)
-  #   optimizer.zero_grad(set_to_none=True)
-  #   loss.backward()
-  #   optimizer.step()
-  #   print(epoch, loss)
-
-  # # After training
-  # # Save the model
-  # print("TRAINIG FINISHED. SAVING THE MODEL")
-  # torch.save(m1.state_dict(), f"{MODEL_NAME}.pt") # pyright: ignore[reportUnknownMemberType]
+  # After training
+  # Save the model
+  print("TRAINING FINISHED. SAVING THE MODEL")
+  torch.save(m1.state_dict(), f"{MODEL_NAME}.pt") # pyright: ignore[reportUnknownMemberType]
 
   # Inference
   m1_trained = Transformer1()
