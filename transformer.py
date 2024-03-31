@@ -1,5 +1,7 @@
 import math
+import os
 from typing import Iterator, cast
+from datetime import datetime
 
 import torch
 import torch.nn as nn
@@ -335,10 +337,16 @@ def estimate_loss(model: Transformer1, train_dataloader: DataLoader[DatasetItem]
     return train_loss, val_loss
 
 def main():
-  # # Train
+  # Train
+  MODEL_NAME = "transform4-vanilla"
+
   m1 = Transformer1()
   print(f"Parameter count: {sum(dict((p.data_ptr(), p.numel()) for p in m1.parameters()).values())}") # https://stackoverflow.com/a/62764464
   m1 = m1.to(DEVICE)
+
+  # If a statedict already exists, we load that statedict so that it continues training from where it left off
+  if os.path.exists(f"{MODEL_NAME}.pt"):
+    m1.load_state_dict(torch.load(f"{MODEL_NAME}.pt")) # pyright: ignore[reportUnknownMemberType]
 
   print("BOOTSTRAPPING THE DATALOADER")
   _, _, train_dataloader, val_dataloader, token_lookup_tables = preprocess.everything()
@@ -356,18 +364,17 @@ def main():
   predicted = preprocess.toks_decode(y_batch[0], token_lookup_tables, "target")
   print(predicted)
 
-  MODEL_NAME = "transform4-vanilla"
   
   print("START TRAINING")
   # Train the network
   # Create an optimizer
   m1.train()
-  optimizer = torch.optim.AdamW(m1.parameters(), lr=5e-5)
+  optimizer = torch.optim.AdamW(m1.parameters(), lr=2.5e-4)
 
   train_losses: list[tuple[int, float]] = []
   val_losses: list[tuple[int, float]] = []
   time_step_losses: list[tuple[int, float]] = [] # Record the losses of each time step
-  MAX_ITER = 10000
+  MAX_ITER = 1000
   for time_step in range(MAX_ITER):
     try:
       batch = next(train_dataloader_iter)
@@ -384,7 +391,7 @@ def main():
     time_step_losses.append((time_step, loss.item()))
     # For every 200 time steps we report the loss
     if time_step % 300 == 0 or time_step == MAX_ITER - 1:
-      train_loss, val_loss = estimate_loss(m1, train_dataloader, val_dataloader, 100)
+      train_loss, val_loss = estimate_loss(m1, train_dataloader, val_dataloader, 60)
       train_losses.append((time_step, train_loss.item()))
       val_losses.append((time_step, val_loss.item()))
       print(f"step {time_step}: train loss {train_loss.item():.4f}, val loss {val_loss.item():.4f}")
@@ -407,29 +414,32 @@ def main():
 
   # Print result to cmd (just first 2 batch)
   for i in range(2):
-    print("Inference: Input words", preprocess.toks_decode(input_seq.tolist()[i], token_lookup_tables, "source")) # type: ignore
+    print("Inference: Input words", preprocess.toks_decode(input_seq.tolist()[i], token_lookup_tables, 'source')) # type: ignore
     print("Inference: Target tokens", target_seq.tolist()[i])  # type: ignore
-    print("Inference: Target words", preprocess.toks_decode(target_seq.tolist()[i], token_lookup_tables, "target"))  # type: ignore
+    print("Inference: Target words", preprocess.toks_decode(target_seq.tolist()[i], token_lookup_tables, 'target'))  # type: ignore
     print("Inference: Output tokens", y_batch[i])
     print("Inference: Output words", preprocess.toks_decode(y_batch[i], token_lookup_tables, "target"))
 
   # Write result as txt
-  with open(f"{MODEL_NAME}-result.txt", "w") as f:
+  NOW = datetime.now()
+  with open(f"{MODEL_NAME}-result-{NOW.strftime('%y%m%d-%H%M')}.txt", "w") as f:
     for i in range(BATCH_SIZE):
       f.write(f"{i}\n")
-      f.write(f"input_words: {preprocess.toks_decode(input_seq[i, :].tolist(), token_lookup_tables, "source")}\n") # type: ignore
-      f.write(f"target_words: {preprocess.toks_decode(target_seq[i, :].tolist(), token_lookup_tables, "target")}\n") # type: ignore
+      f.write(f"input_words: {preprocess.toks_decode(input_seq[i, :].tolist(), token_lookup_tables, 'source')}\n") # type: ignore
+      f.write(f"target_words: {preprocess.toks_decode(target_seq[i, :].tolist(), token_lookup_tables, 'target')}\n") # type: ignore
       f.write(f"target_tokens: {target_seq[i, :].tolist()}\n") # type: ignore
-      f.write(f"predicted_words: {preprocess.toks_decode(y_batch[i], token_lookup_tables, "target")}\n") # type: ignore
+      f.write(f"predicted_words: {preprocess.toks_decode(y_batch[i], token_lookup_tables, 'target')}\n") # type: ignore
       f.write(f"predicted_tokens: {y_batch[i]}\n")
 
   # Record the losses
-  with open(f"{MODEL_NAME}-losses.txt", "w") as f:
+  with open(f"{MODEL_NAME}-losses-{NOW.strftime('%y%m%d-%H%M')}.txt", "w") as f:
     f.write("TIME STEP LOSS\n")
     for time_step, loss in time_step_losses:
       f.write(f"{time_step} {loss}\n")
+    f.write("MEAN TRAIN LOSS\n")
     for time_step, loss in train_losses:
       f.write(f"{time_step} {loss}\n")
+    f.write("MEAN VAL LOSS\n")
     for time_step, loss in val_losses:
       f.write(f"{time_step} {loss}\n")
 
