@@ -1,17 +1,18 @@
+import json
+import os
+from dataclasses import dataclass, field
+from typing import Any, Literal, NamedTuple
+
+import gdown  # pyright: ignore[reportMissingTypeStubs]
 import spacy
 import torch
-import json
-from dataclasses import dataclass, field
-from typing import Literal, Any, NamedTuple
-from torch.utils.data import Dataset, DataLoader
-import os
-import gdown
+from torch.utils.data import DataLoader, Dataset
 
 # Prepare Stanford's Stanza to tokenize the columns and tables names
 # stanza.download('en')
 # stanza_nlp = stanza.Pipeline(processors='tokenize,mwt,pos,lemma', lang='en')
 
-BATCH_SIZE = 16
+BATCH_SIZE = 24
 
 ColumnType = Literal["time", "text", "number", "boolean", "others"]
 
@@ -392,7 +393,7 @@ def everything():
 def download_spider_zip():
   spider_url = "https://drive.google.com/u/0/uc?id=1iRDVHLr4mX2wQKSgA9J8Pire73Jahh0m&export=download"  # https://yale-lily.github.io/spider
   if not os.path.exists("spider.zip"):
-    gdown.download(spider_url, "spider.zip", quiet=False)
+    gdown.download(spider_url, "spider.zip", quiet=False) # pyright: ignore[reportUnknownMemberType]
 
 
 if __name__ == "__main__":

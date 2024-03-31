@@ -4,9 +4,11 @@ from typing import Iterator, cast
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+from torch.utils.data import DataLoader
 
 import preprocess
-from preprocess import BLOCK_SIZE, SRC_VOCAB_SIZE, TGT_SIZE, TGT_VOCAB_SIZE, BATCH_SIZE, DatasetItem
+from preprocess import (BATCH_SIZE, BLOCK_SIZE, SRC_VOCAB_SIZE, TGT_SIZE,
+                        TGT_VOCAB_SIZE, DatasetItem)
 from util import UnpackedSequential
 
 DROP_OUT = 0.2
@@ -296,6 +298,41 @@ class Transformer1(nn.Module):
         for j, chosen_token in enumerate(chosen_tokens):
           predicted_tokens[j].append(int(chosen_token.item()))
       return predicted_tokens
+    
+def estimate_loss(model: Transformer1, train_dataloader: DataLoader[DatasetItem], val_dataloader: DataLoader[DatasetItem], loss_batch_size: int = 200):
+    """Estimate a more 'accurate' loss by averaging over multiple batches"""
+    with torch.no_grad():
+      model.eval()
+      train_loss = 0
+      val_loss = 0
+      train_dataloader_iter = iter(train_dataloader)
+      val_dataloader_iter = iter(val_dataloader)
+      losses = torch.zeros(loss_batch_size)
+      # Training loss
+      for i in range(loss_batch_size):
+        try:
+          input, target = next(train_dataloader_iter)
+        except StopIteration:
+          train_dataloader_iter = iter(train_dataloader)
+          input, target = next(train_dataloader_iter)
+        _, loss = model(input.to(DEVICE), target.to(DEVICE))
+        losses[i] = loss.item()
+      train_loss = losses.mean()
+
+      # Validation loss
+      losses = torch.zeros(loss_batch_size)
+      for i in range(loss_batch_size):
+        try:
+          input, target = next(val_dataloader_iter)
+        except StopIteration:
+          val_dataloader_iter = iter(val_dataloader)
+          input, target = next(val_dataloader_iter)
+        _, loss = model(input.to(DEVICE), target.to(DEVICE))
+        losses[i] = loss.item()
+      val_loss = losses.mean()
+      
+    model.train()
+    return train_loss, val_loss
 
 def main():
   # # Train
@@ -304,7 +341,7 @@ def main():
   m1 = m1.to(DEVICE)
 
   print("BOOTSTRAPPING THE DATALOADER")
-  _, _, train_dataloader, _, token_lookup_tables = preprocess.everything()
+  _, _, train_dataloader, val_dataloader, token_lookup_tables = preprocess.everything()
 
   m1.eval()
   train_dataloader_iter = cast(Iterator[DatasetItem], iter(train_dataloader))
@@ -319,8 +356,7 @@ def main():
   predicted = preprocess.toks_decode(y_batch[0], token_lookup_tables, "target")
   print(predicted)
 
-  MODEL_NAME = "transform3"
-  
+  MODEL_NAME = "transform4-vanilla"
   
   print("START TRAINING")
   # Train the network
@@ -328,7 +364,11 @@ def main():
   m1.train()
   optimizer = torch.optim.AdamW(m1.parameters(), lr=5e-5)
 
-  for epoch in range(20000):
+  train_losses: list[tuple[int, float]] = []
+  val_losses: list[tuple[int, float]] = []
+  time_step_losses: list[tuple[int, float]] = [] # Record the losses of each time step
+  MAX_ITER = 10000
+  for time_step in range(MAX_ITER):
     try:
       batch = next(train_dataloader_iter)
     except StopIteration:
@@ -341,7 +381,13 @@ def main():
     optimizer.zero_grad(set_to_none=True)
     loss.backward()
     optimizer.step()
-    print(epoch, loss)
+    time_step_losses.append((time_step, loss.item()))
+    # For every 200 time steps we report the loss
+    if time_step % 300 == 0 or time_step == MAX_ITER - 1:
+      train_loss, val_loss = estimate_loss(m1, train_dataloader, val_dataloader, 100)
+      train_losses.append((time_step, train_loss.item()))
+      val_losses.append((time_step, val_loss.item()))
+      print(f"step {time_step}: train loss {train_loss.item():.4f}, val loss {val_loss.item():.4f}")
 
   # After training
   # Save the model
@@ -376,6 +422,16 @@ def main():
       f.write(f"target_tokens: {target_seq[i, :].tolist()}\n") # type: ignore
       f.write(f"predicted_words: {preprocess.toks_decode(y_batch[i], token_lookup_tables, "target")}\n") # type: ignore
       f.write(f"predicted_tokens: {y_batch[i]}\n")
+
+  # Record the losses
+  with open(f"{MODEL_NAME}-losses.txt", "w") as f:
+    f.write("TIME STEP LOSS\n")
+    for time_step, loss in time_step_losses:
+      f.write(f"{time_step} {loss}\n")
+    for time_step, loss in train_losses:
+      f.write(f"{time_step} {loss}\n")
+    for time_step, loss in val_losses:
+      f.write(f"{time_step} {loss}\n")
 
 if __name__ == "__main__":
   preprocess.download_spider_zip()
