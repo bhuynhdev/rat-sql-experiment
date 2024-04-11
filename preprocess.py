@@ -3,10 +3,10 @@ import os
 from dataclasses import dataclass, field
 from typing import Any, Literal, NamedTuple
 
-import gdown  # pyright: ignore[reportMissingTypeStubs]
 import spacy
 import torch
 from torch.utils.data import DataLoader, Dataset
+from download_spider import download_spider_zip, extract_zip
 
 # Prepare Stanford's Stanza to tokenize the columns and tables names
 # stanza.download('en')
@@ -390,17 +390,12 @@ def everything():
   return (train_dataset, val_dataset, train_dataloader, val_dataloader, token_lookup_tables)
 
 
-def download_spider_zip():
-  spider_url = "https://drive.google.com/u/0/uc?id=1iRDVHLr4mX2wQKSgA9J8Pire73Jahh0m&export=download"  # https://yale-lily.github.io/spider
-  if not os.path.exists("spider.zip"):
-    gdown.download(spider_url, "spider.zip", quiet=False) # pyright: ignore[reportUnknownMemberType]
-
-
 if __name__ == "__main__":
-  download_spider_zip()
+  spider_zip_path = download_spider_zip()
+  extract_zip(spider_zip_path)
 
   if not os.path.exists("spider"):
-    raise Exception("'spider' folder not found")
+    raise Exception("'spider' folder not found. Have you download and extracted the 'spider.zip' file?")
 
   train_dataset, val_dataset, train_dataloader, val_dataloader, token_lookup_tables = everything()
 
