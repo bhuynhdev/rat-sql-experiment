@@ -95,6 +95,8 @@ class ReduceAction(Action):
 
 
 class GenTokenAction(Action):
+    def __repr__(self):
+        return "GenToken"
     token: str
 
 
@@ -137,12 +139,12 @@ class Partial(Result[T]):
 class ParseError(ValueError):
     pass
 
-
 class TransitionSystem(object):
     def __init__(self, grammar: ASDLGrammar):
         self.grammar: ASDLGrammar = grammar
 
     def _tokenize(self, s: str) -> Tuple[str, List[str]]:
+        s = s[:-2] if s.endswith(".0") else s
         tokens = s.split(" ")
         # guard against empty token sequences
         if len(tokens) == 0:
@@ -398,7 +400,8 @@ class TransitionSystem(object):
     def _parse_gen_token(frontier_field: Field, parent_pos: Pos) -> Partial[str]:
         def _cont(pos: Pos, action: Action) -> Done[str]:
             if isinstance(action, GenTokenAction):
-                return Done(res=action.token)
+                # Dirty fix: For some weird reasons, end of token generation is a []
+                return Done(res=action.token if not isinstance(action.token, list) else "</token>")
             else:
                 raise ParseError(
                     "Expected {!r}, got {!r} at position {!r}".format(

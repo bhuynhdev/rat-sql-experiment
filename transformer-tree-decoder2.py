@@ -9,7 +9,7 @@ from torch.utils.data import DataLoader
 
 import preprocess
 from preprocess import (BATCH_SIZE, BLOCK_SIZE, SRC_VOCAB_SIZE, TGT_SIZE,
-                        TGT_VOCAB_SIZE, DatasetItem)
+                        TGT_VOCAB_SIZE, DatasetItem, ModelInput)
 from util import UnpackedSequential
 from grammars.spider_transition_system import SpiderTransitionSystem
 
@@ -24,7 +24,7 @@ DEVICE = device
 
 class SingleHeadAttention(nn.Module):
   def __init__(self, emb_size: int, head_size: int):
-    super().__init__() # pyright: ignore[reportUnknownMemberType]
+    super().__init__()  # pyright: ignore[reportUnknownMemberType]
     self.emb_size = emb_size
     self.head_size = head_size
     # Each head has its own W_Q, W_K, and W_V matrixes for transform the each tok emd to its corresponding q, k, v vectors
@@ -64,7 +64,7 @@ class SingleHeadCrossAttention(nn.Module):
   """
 
   def __init__(self, emb_size: int, head_size: int):
-    super().__init__() # pyright: ignore[reportUnknownMemberType]
+    super().__init__()  # pyright: ignore[reportUnknownMemberType]
     self.emb_size = emb_size
     self.head_size = head_size
     # Each head has its own W_Q, W_K, and W_V matrixes for transform the each tok emd to its corresponding q, k, v vectors
@@ -116,7 +116,7 @@ class MultiHeadAttention(nn.Module):
 
 class MultiHeadCrossAttention(nn.Module):
   def __init__(self, emb_size: int, num_head: int, is_masked: bool):
-    super().__init__() # pyright: ignore[reportUnknownMemberType]
+    super().__init__()  # pyright: ignore[reportUnknownMemberType]
     self.emb_size = emb_size
     self.is_masked_attention = is_masked
     # Each head size is emb_size / num_head so that at the end, when we concat all vectors from each head, we still get a vector of emb_size
@@ -136,7 +136,7 @@ class PositionWiseFeedForward(nn.Module):
   """
 
   def __init__(self, emb_size: int):
-    super().__init__() # pyright: ignore[reportUnknownMemberType]
+    super().__init__()  # pyright: ignore[reportUnknownMemberType]
     self.feed_forward = nn.Sequential(
       nn.Linear(emb_size, 4 * emb_size),
       nn.ReLU(),
@@ -152,7 +152,7 @@ class EncoderBlock(nn.Module):
   """A Transformer Encoder block: A self-attention followed by feedforward net"""
 
   def __init__(self, emb_size: int, num_attention_heads: int):
-    super().__init__() # pyright: ignore[reportUnknownMemberType]
+    super().__init__()  # pyright: ignore[reportUnknownMemberType]
     self.self_attention = MultiHeadAttention(emb_size, num_attention_heads, is_masked=False)
     self.feed_forward = PositionWiseFeedForward(emb_size)
     self.layer_norm1 = nn.LayerNorm(emb_size)  # Layer norm for the self-attention sublayer
@@ -167,7 +167,7 @@ class EncoderBlock(nn.Module):
 
 class DecoderBlock(nn.Module):
   def __init__(self, emb_size: int, num_attention_heads: int):
-    super().__init__() # pyright: ignore[reportUnknownMemberType]
+    super().__init__()  # pyright: ignore[reportUnknownMemberType]
     self.masked_self_attention = MultiHeadAttention(emb_size, num_attention_heads, is_masked=False)
     self.cross_attention = MultiHeadCrossAttention(emb_size, num_attention_heads, is_masked=False)
     self.feed_forward = PositionWiseFeedForward(emb_size)
@@ -201,7 +201,7 @@ class Transformer1(nn.Module):
     Parameters:
       emb_size: the size of each word embeddings. For example: GloVe embeddings is 300, BERT is 768
     """
-    super().__init__() # pyright: ignore[reportUnknownMemberType]
+    super().__init__()  # pyright: ignore[reportUnknownMemberType]
     self.emb_size = emb_size
     # 4 encoder blocks
     self.encoder_layers = nn.Sequential(
@@ -221,7 +221,7 @@ class Transformer1(nn.Module):
     # DECODER COMPONENTS
     # Input to the decoder concists of emb of prev action + emb frontier field + emb frontier type
     self.decoder_hidden_size = emb_size * 3
-    self.register_buffer("positional_embedding_tgt", compute_pos_encoding(TGT_SIZE, self.emb_size))
+    self.register_buffer("positional_embedding_tgt", compute_pos_encoding(TGT_SIZE, self.decoder_hidden_size))
     self.decoder_token_emb = nn.Embedding(TGT_VOCAB_SIZE, emb_size, padding_idx=0)
     self.decoder_field_emb = nn.Embedding(len(transition_system.grammar.fields) + 1, emb_size, padding_idx=0)
     self.decoder_type_emb = nn.Embedding(len(transition_system.grammar.types) + 1, emb_size, padding_idx=0)
@@ -235,20 +235,25 @@ class Transformer1(nn.Module):
       DecoderBlock(emb_size, num_attention_heads=4),
     )
 
-  def forward(self, input_idx: torch.Tensor, target_idx: torch.Tensor):
+  def forward(self, batch: ModelInput):
     """
     Parameters:
       target_idx: the list of target tokens across the batches. Dimension (B, T)
     """
     # First, encode
-    encoder_emb = self.encode(input_idx)  # (B, T, E)
+    encoder_emb = self.encode(batch.input)  # (B, T, E)
     # Shift right the target_idx to add the <START> token
     start_tokens = torch.ones((BATCH_SIZE, 1), device=DEVICE, dtype=torch.int64)
-    shifted_input = torch.cat((start_tokens, target_idx[:, :-1]), dim=1)
+    shifted_input = torch.cat((start_tokens, batch.target[:, :-1]), dim=1)
     # Now, decode
     y, _ = self.decode(encoder_emb, shifted_input)
+    loss = self.compute_loss(y, batch)
+    return y, loss
+
+  def compute_loss(self, decoder_output: torch.Tensor, batch: ModelInput):
+    target_idx = batch.target
     # Convert target embeddings to target probs
-    predicted_target_probs = self.tgt_lm_head(y)  # (B, T, C) where C = tgt_vocab_size
+    predicted_target_probs = self.tgt_lm_head(decoder_output)  # (B, T, C) where C = tgt_vocab_size
     assert predicted_target_probs.shape == (BATCH_SIZE, TGT_SIZE, TGT_VOCAB_SIZE)
     # Cross_entropy requires the "Class" dimension to be the 2nd dimension
     B, T, C = predicted_target_probs.shape
@@ -256,7 +261,7 @@ class Transformer1(nn.Module):
     target_idx = target_idx.view(B * T)
     # Calculate loss
     loss = F.cross_entropy(predicted_target_probs, target_idx, ignore_index=0)
-    return y, loss
+    return loss
 
   def encode(self, input_batch: torch.Tensor):
     # Input batch is of shape (B, T) (i.e. (batch size, block_size))
@@ -294,7 +299,7 @@ class Transformer1(nn.Module):
         assert y.shape == (BATCH_SIZE, TGT_SIZE, self.emb_size)
         y, _ = self.decoder_layers((y, encoder_emb))
         tgt_probs = self.tgt_lm_head(y)  # (B, T, C) where C = tgt_vocab_size
-        tgt_probs_this_time_step = tgt_probs[:,i,:] # (B, 1, C)
+        tgt_probs_this_time_step = tgt_probs[:, i, :]  # (B, 1, C)
         chosen_tokens = torch.argmax(tgt_probs_this_time_step, dim=-1)  # (B, 1)
         if i < max_generated_tokens - 1:
           # Add the predicted tokens as new input target tokens to be used to generate next word
@@ -304,41 +309,43 @@ class Transformer1(nn.Module):
         for j, chosen_token in enumerate(chosen_tokens):
           predicted_tokens[j].append(int(chosen_token.item()))
       return predicted_tokens
-    
-def estimate_loss(model: Transformer1, train_dataloader: DataLoader[DatasetItem], val_dataloader: DataLoader[DatasetItem], loss_batch_size: int = 200):
-    """Estimate a more 'accurate' loss by averaging over multiple batches"""
-    with torch.no_grad():
-      model.eval()
-      train_loss = 0
-      val_loss = 0
-      train_dataloader_iter = iter(train_dataloader)
-      val_dataloader_iter = iter(val_dataloader)
-      losses = torch.zeros(loss_batch_size)
-      # Training loss
-      for i in range(loss_batch_size):
-        try:
-          batch = next(train_dataloader_iter)
-        except StopIteration:
-          train_dataloader_iter = iter(train_dataloader)
-          batch = next(train_dataloader_iter)
-        _, loss = model(batch.input.to(DEVICE), batch.target.to(DEVICE))
-        losses[i] = loss.item()
-      train_loss = losses.mean()
 
-      # Validation loss
-      losses = torch.zeros(loss_batch_size)
-      for i in range(loss_batch_size):
-        try:
-          batch = next(val_dataloader_iter)
-        except StopIteration:
-          val_dataloader_iter = iter(val_dataloader)
-          batch = next(val_dataloader_iter)
-        _, loss = model(batch.input.to(DEVICE), batch.target.to(DEVICE))
-        losses[i] = loss.item()
-      val_loss = losses.mean()
-      
-    model.train()
-    return train_loss, val_loss
+
+def estimate_loss(model: Transformer1, train_dataloader: DataLoader[DatasetItem], val_dataloader: DataLoader[DatasetItem], loss_batch_size: int = 200):
+  """Estimate a more 'accurate' loss by averaging over multiple batches"""
+  with torch.no_grad():
+    model.eval()
+    train_loss = 0
+    val_loss = 0
+    train_dataloader_iter = iter(train_dataloader)
+    val_dataloader_iter = iter(val_dataloader)
+    losses = torch.zeros(loss_batch_size)
+    # Training loss
+    for i in range(loss_batch_size):
+      try:
+        batch = next(train_dataloader_iter)
+      except StopIteration:
+        train_dataloader_iter = iter(train_dataloader)
+        batch = next(train_dataloader_iter)
+      _, loss = model(batch.input.to(DEVICE), batch.target.to(DEVICE))
+      losses[i] = loss.item()
+    train_loss = losses.mean()
+
+    # Validation loss
+    losses = torch.zeros(loss_batch_size)
+    for i in range(loss_batch_size):
+      try:
+        batch = next(val_dataloader_iter)
+      except StopIteration:
+        val_dataloader_iter = iter(val_dataloader)
+        batch = next(val_dataloader_iter)
+      _, loss = model(batch.input.to(DEVICE), batch.target.to(DEVICE))
+      losses[i] = loss.item()
+    val_loss = losses.mean()
+
+  model.train()
+  return train_loss, val_loss
+
 
 def main():
   # Train
@@ -347,12 +354,12 @@ def main():
   ts = SpiderTransitionSystem("grammars/Spider2.asdl", output_from=True)
 
   m1 = Transformer1(transition_system=ts)
-  print(f"Parameter count: {sum(dict((p.data_ptr(), p.numel()) for p in m1.parameters()).values())}") # https://stackoverflow.com/a/62764464
+  print(f"Parameter count: {sum(dict((p.data_ptr(), p.numel()) for p in m1.parameters()).values())}")  # https://stackoverflow.com/a/62764464
   m1 = m1.to(DEVICE)
 
   # If a statedict already exists, we load that statedict so that it continues training from where it left off
   if os.path.exists(f"{MODEL_NAME}.pt"):
-    m1.load_state_dict(torch.load(f"{MODEL_NAME}.pt")) # pyright: ignore[reportUnknownMemberType]
+    m1.load_state_dict(torch.load(f"{MODEL_NAME}.pt"))  # pyright: ignore[reportUnknownMemberType]
 
   print("BOOTSTRAPPING THE DATALOADER")
   train_dataset, _, train_dataloader, val_dataloader, vocabs = preprocess.everything()
@@ -370,84 +377,92 @@ def main():
   predicted = vocabs.action_vocab.decode(y_batch)
   print(predicted)
 
-  
   print("START TRAINING")
   NOW = datetime.now()
 
   # Train the network
   # Create an optimizer
-  # m1.train()
-  # optimizer = torch.optim.AdamW(m1.parameters(), lr=2.5e-4)
+  m1.train()
+  optimizer = torch.optim.AdamW(m1.parameters(), lr=2.5e-4)
 
-  # train_losses: list[tuple[int, float]] = []
-  # val_losses: list[tuple[int, float]] = []
-  # time_step_losses: list[tuple[int, float]] = [] # Record the losses of each time step
-  # MAX_ITER = 200
-  # for time_step in range(MAX_ITER):
-  #   try:
-  #     batch = next(train_dataloader_iter)
-  #   except StopIteration:
-  #     # Reset the dataloader
-  #     train_dataloader_iter = iter(train_dataloader)
-  #     batch = next(train_dataloader_iter)
-  #   input = batch.input.to(DEVICE)  # (B, block_size)
-  #   target = batch.target.to(DEVICE)  # (B, TGT_SIZE)
-  #   _, loss = m1(input, target)
-  #   optimizer.zero_grad(set_to_none=True)
-  #   loss.backward()
-  #   optimizer.step()
-  #   time_step_losses.append((time_step, loss.item()))
-  #   # For every 200 time steps we report the loss
-  #   if time_step % 50 == 0 or time_step == MAX_ITER - 1:
-  #     train_loss, val_loss = estimate_loss(m1, train_dataloader, val_dataloader, 24)
-  #     train_losses.append((time_step, train_loss.item()))
-  #     val_losses.append((time_step, val_loss.item()))
-  #     print(f"step {time_step}: train loss {train_loss.item():.4f}, val loss {val_loss.item():.4f}")
+  train_losses: list[tuple[int, float]] = []
+  val_losses: list[tuple[int, float]] = []
+  time_step_losses: list[tuple[int, float]] = []  # Record the losses of each time step
+  MAX_ITER = 200
+  for time_step in range(MAX_ITER):
+    try:
+      batch = next(train_dataloader_iter)
+    except StopIteration:
+      # Reset the dataloader
+      train_dataloader_iter = iter(train_dataloader)
+      batch: ModelInput = next(train_dataloader_iter)
+    # Send all fields in the batch to CUDA
+    batch.input = batch.input.to(DEVICE)
+    batch.target = batch.target.to(DEVICE)
+    batch.action_mask = batch.action_mask.to(DEVICE)
+    batch.copy_mask = batch.copy_mask.to(DEVICE)
+    batch.copy_target_mask = batch.copy_target_mask.to(DEVICE)
+    batch.field_idx = batch.field_idx.to(DEVICE)
+    batch.type_idx = batch.type_idx.to(DEVICE)
+    
+    _, loss = m1(batch)
+    optimizer.zero_grad(set_to_none=True)
+    loss.backward()
+    optimizer.step()
+    time_step_losses.append((time_step, loss.item()))
+    # For every 200 time steps we report the loss
+    if time_step % 50 == 0 or time_step == MAX_ITER - 1:
+      train_loss, val_loss = estimate_loss(m1, train_dataloader, val_dataloader, 24)
+      train_losses.append((time_step, train_loss.item()))
+      val_losses.append((time_step, val_loss.item()))
+      print(f"step {time_step}: train loss {train_loss.item():.4f}, val loss {val_loss.item():.4f}")
 
-  # # After training
-  # # Save the model
-  # print("TRAINING FINISHED. SAVING THE MODEL")
-  # torch.save(m1.state_dict(), f"{MODEL_NAME}.pt") # pyright: ignore[reportUnknownMemberType]
-
-  # # Record the losses
-  # with open(f"{MODEL_NAME}-losses-{NOW.strftime('%y%m%d-%H%M')}.txt", "w") as f:
-  #   f.write("TIME STEP LOSS\n")
-  #   for time_step, loss in time_step_losses:
-  #     f.write(f"{time_step} {loss}\n")
-  #   f.write("MEAN TRAIN LOSS\n")
-  #   for time_step, loss in train_losses:
-  #     f.write(f"{time_step} {loss}\n")
-  #   f.write("MEAN VAL LOSS\n")
-  #   for time_step, loss in val_losses:
-  #     f.write(f"{time_step} {loss}\n")
+  # After training
+  # Save the model
+  print("TRAINING FINISHED. SAVING THE MODEL")
+  torch.save(m1.state_dict(), f"{MODEL_NAME}.pt")  # pyright: ignore[reportUnknownMemberType]
+  # Record the losses
+  with open(f"{MODEL_NAME}-losses-{NOW.strftime('%y%m%d-%H%M')}.txt", "w") as f:
+    f.write("TIME STEP LOSS\n")
+    for time_step, loss in time_step_losses:
+      f.write(f"{time_step} {loss}\n")
+    f.write("MEAN TRAIN LOSS\n")
+    for time_step, loss in train_losses:
+      f.write(f"{time_step} {loss}\n")
+    f.write("MEAN VAL LOSS\n")
+    for time_step, loss in val_losses:
+      f.write(f"{time_step} {loss}\n")
 
   # Inference
   m1_trained = Transformer1(transition_system=ts)
   m1_trained = m1_trained.to(DEVICE)
-  m1_trained.load_state_dict(torch.load(f"{MODEL_NAME}.pt")) # pyright: ignore[reportUnknownMemberType]
+  m1_trained.load_state_dict(torch.load(f"{MODEL_NAME}.pt"))  # pyright: ignore[reportUnknownMemberType]
   m1_trained.eval()
 
   batch = next(train_dataloader_iter)
 
-  y_batch = m1_trained.generate(batch.input.to(DEVICE), max_generated_tokens=TGT_SIZE)
+
+  input_seq, target_seq = batch
+  y_batch = m1_trained.generate(input_seq.to(DEVICE), max_generated_tokens=TGT_SIZE)
 
   # Print result to cmd (just first 2 batch)
   for i in range(2):
-    print("Inference: Input words", vocabs.src_vocab.decode(batch.input.tolist()[i]))
-    print("Inference: Target tokens", batch.target.tolist()[i])
-    print("Inference: Target words", vocabs.action_vocab.decode(batch.target.tolist()[i]))
+    print("Inference: Input words", preprocess.toks_decode(input_seq.tolist()[i], token_lookup_tables, 'source'))  # type: ignore
+    print("Inference: Target tokens", target_seq.tolist()[i])  # type: ignore
+    print("Inference: Target words", preprocess.toks_decode(target_seq.tolist()[i], token_lookup_tables, 'target'))  # type: ignore
     print("Inference: Output tokens", y_batch[i])
-    print("Inference: Output words", vocabs.action_vocab.decode(y_batch[i]))
+    print("Inference: Output words", preprocess.toks_decode(y_batch[i], token_lookup_tables, "target"))
 
   # Write result as txt
   with open(f"{MODEL_NAME}-result-{NOW.strftime('%y%m%d-%H%M')}.txt", "w") as f:
     for i in range(BATCH_SIZE):
       f.write(f"{i}\n")
-      f.write(f"input_words: {vocabs.src_vocab.decode(batch.input[i, :].tolist())}\n")
-      f.write(f"target_words: {vocabs.action_vocab.decode(batch.target[i, :].tolist())}\n")
-      f.write(f"target_tokens: {batch.target[i, :].tolist()}\n")
-      f.write(f"predicted_words: {vocabs.action_vocab.decode(y_batch[i])}\n")
+      f.write(f"input_words: {preprocess.toks_decode(input_seq[i, :].tolist(), token_lookup_tables, 'source')}\n")  # type: ignore
+      f.write(f"target_words: {preprocess.toks_decode(target_seq[i, :].tolist(), token_lookup_tables, 'target')}\n")  # type: ignore
+      f.write(f"target_tokens: {target_seq[i, :].tolist()}\n")  # type: ignore
+      f.write(f"predicted_words: {preprocess.toks_decode(y_batch[i], token_lookup_tables, 'target')}\n")  # type: ignore
       f.write(f"predicted_tokens: {y_batch[i]}\n")
+
 
 if __name__ == "__main__":
   main()

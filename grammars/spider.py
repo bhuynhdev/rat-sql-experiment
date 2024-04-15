@@ -29,7 +29,7 @@ import attr
 import networkx as nx
 
 import grammars.ast_util as ast_util
-from preprocess import Database as SpiderSchema
+from typing import Any
 
 def bimap(first, second):
     return {f: s for f, s in zip(first, second)}, {s: f for f, s in zip(first, second)}
@@ -105,7 +105,7 @@ class SpiderGrammar:
     def parse(self, code: dict):
         return self.parse_sql(code)
 
-    def unparse(self, tree, spider_schema: SpiderSchema):
+    def unparse(self, tree, spider_schema: Any):
         unparser = SpiderUnparser(self.ast_wrapper, spider_schema)
         return unparser.unparse_sql(tree)
 
