@@ -263,6 +263,7 @@ class DatasetItem(NamedTuple):
   - frontier_fields = Frontier fields of each action in `target_actions`
   - frontier_fields_idx = token indexes of the frontier field of each action in the target_seq -> Dim (target_block_size)
   - frontier_typess_idx = token indexes of the type of each frontier field type
+  - primitive_seq = a tensor of size (target_block_size) where each entry is 0 to 7 to indicate which primitve field should that time step use (0 means "None")
  """
   id: int
   item: SpiderItem
@@ -275,6 +276,7 @@ class DatasetItem(NamedTuple):
   frontier_fields: list[Union[Field, None]]
   frontier_fields_idx: torch.Tensor
   frontier_types_idx: torch.Tensor
+  primitive_seq: torch.Tensor
 
 
 def construct_input_sequence(item: SpiderItem):
@@ -350,6 +352,16 @@ class MyDataset(Dataset[DatasetItem]):
     self.block_size = 0  # The maximum input sequence size
     self.target_size = 0  # The maximum target sequence size
 
+    PRIMITIVE_TOK_TO_IDX = {
+      "None": 0,
+      "TablePrimitive": 1,
+      "ColumnPrimitive": 2,
+      "SingletonPrimitive": 3,
+      "StringPrimitive": 4,
+      "ObjectPrimitive": 5,
+      "IntPrimitive": 6,
+    }
+
     for i, item in enumerate(all_items):
       # Encoder item preprocessing
       # columns_tokens = [c.name_toks for c in item.db.columns[1:]]  # Skip the 0th-index "*" column
@@ -365,9 +377,10 @@ class MyDataset(Dataset[DatasetItem]):
 
       target_actions = transition_system.get_actions(transition_system.surface_code_to_ast(item.qa_pair.sql_tree))
       target_tokens: list[str] = []
-      action_mask = torch.zeros(len(target_actions))
-      copy_mask = torch.ones(len(target_actions))
-      copy_target_mask = torch.zeros(len(input_sequence))
+      primitive_tokens: list[str] = []
+      action_mask = torch.zeros(len(target_actions), dtype=torch.int64)
+      copy_mask = torch.ones(len(target_actions), dtype=torch.int64)
+      copy_target_mask = torch.zeros(len(input_sequence), dtype=torch.int64)
 
       # Initiate a parsing process in order to retrieve frontier_field information
       parse_result = transition_system.parse()
@@ -382,9 +395,11 @@ class MyDataset(Dataset[DatasetItem]):
           action_mask[pos] = 1
           copy_mask[pos] = 0
           target_tokens.append(repr(action))
+          primitive_tokens.append("None")
         else:  # If not ApplyRule or Reduce, then must be GenToken
           assert isinstance(action, SpiderGenTokenAction)
           if str(action.token) == "[]":  # Special token that indicates end of primitve token generation
+            primitive_tokens.append("None")
             continue
           # assert not isinstance(action.token, list), f"Expected {action.token} to be str. SQL {item.qa_pair.query}\nACTIONS {target_actions}"
           if isinstance(action, SpiderSingletonAction) or isinstance(action, SpiderIntAction):
@@ -392,8 +407,10 @@ class MyDataset(Dataset[DatasetItem]):
             action_mask[pos] = 1
             copy_mask[pos] = 0
             target_tokens.append(repr(action))
+            primitive_tokens.append("None")
             continue
           # Else, every other type of GenToken action is copied from input, so we fill out the copy_mask and copy_target_mask
+          primitive_tokens.append(repr(action).split("[")[0])
           if isinstance(action, SpiderColumnAction):
             column_index = int(action.token)
             column_position_in_input = column_position_map.get(column_index, None)
@@ -421,9 +438,10 @@ class MyDataset(Dataset[DatasetItem]):
       self.target_size = max(self.target_size, len(target_tokens))
       
       target_sequence = torch.tensor(self.vocabs.action_vocab.encode(target_tokens), dtype=torch.int64)
+      primitive_sequence = torch.tensor([PRIMITIVE_TOK_TO_IDX[t] for t in primitive_tokens], dtype=torch.int64)
       # Plus one to the tokenIds because we'll be using index 0 for None frontier field
-      frontier_fields_idx = torch.Tensor([transition_system.grammar.field2id[f] + 1 if f else 0 for f in frontier_fields])
-      frontier_field_types_idx = torch.Tensor([transition_system.grammar.type2id[f.type] + 1 if f else 0 for f in frontier_fields])
+      frontier_fields_idx = torch.tensor([transition_system.grammar.field2id[f] + 1 if f else 0 for f in frontier_fields], dtype=torch.int64)
+      frontier_field_types_idx = torch.tensor([transition_system.grammar.type2id[f.type] + 1 if f else 0 for f in frontier_fields], dtype=torch.int64)
       # Pad the sequences so they matches the max length
       input_sequence = torch.nn.functional.pad(input_sequence, (0, BLOCK_SIZE - input_sequence.size(0)), value=0)
       target_sequence = torch.nn.functional.pad(target_sequence, (0, TGT_SIZE - target_sequence.size(0)), value=0)
@@ -432,6 +450,7 @@ class MyDataset(Dataset[DatasetItem]):
       frontier_fields_idx = torch.nn.functional.pad(frontier_fields_idx, (0, TGT_SIZE - frontier_fields_idx.size(0)), value=0)
       frontier_field_types_idx = torch.nn.functional.pad(frontier_field_types_idx, (0, TGT_SIZE - frontier_field_types_idx.size(0)), value=0)
       copy_target_mask = torch.nn.functional.pad(copy_target_mask, (0, BLOCK_SIZE - copy_target_mask.size(0)), value=0)
+      primitive_sequence = torch.nn.functional.pad(primitive_sequence, (0, TGT_SIZE - primitive_sequence.size(0)), value=0)
       assert input_sequence.shape == (BLOCK_SIZE,)
       assert target_sequence.shape == (TGT_SIZE,)
 
@@ -446,7 +465,8 @@ class MyDataset(Dataset[DatasetItem]):
         frontier_types_idx=frontier_field_types_idx,
         action_mask=action_mask,
         copy_mask=copy_mask,
-        copy_target_mask=copy_target_mask
+        copy_target_mask=copy_target_mask,
+        primitive_seq=primitive_sequence
       ))
 
   def __len__(self):
@@ -469,6 +489,7 @@ BLOCK_SIZE = 1309
 TGT_SIZE = 191
 SRC_VOCAB_SIZE = 4195
 TGT_VOCAB_SIZE = 1638
+PRIMITIVE_VOCAB_SIZE = 7 # There are 7 primitives in SQL ASDL
 
 @dataclass
 class ModelInput:
@@ -480,6 +501,7 @@ class ModelInput:
   copy_target_mask: torch.Tensor
   field_idx: torch.Tensor
   type_idx: torch.Tensor
+  primitive_seq: torch.Tensor
 
 def collate_function(batch: list[DatasetItem]):
   ids = [b.id for b in batch]
@@ -490,6 +512,7 @@ def collate_function(batch: list[DatasetItem]):
   copy_target_masks = [b.copy_target_mask for b in batch]
   field_seqs = [b.frontier_fields_idx for b in batch]
   type_seqs = [b.frontier_types_idx for b in batch]
+  pritimive_seqs = [b.primitive_seq for b in batch]
 
   return ModelInput(
     id=torch.tensor(ids),
@@ -500,6 +523,7 @@ def collate_function(batch: list[DatasetItem]):
     copy_target_mask = torch.stack(copy_target_masks),
     field_idx = torch.stack(field_seqs),
     type_idx = torch.stack(type_seqs),
+    primitive_seq = torch.stack(pritimive_seqs)
   )
 
 def create_dataloaders(train_dataset: MyDataset, val_dataset: MyDataset, batch_size: int, num_workers: int = 4):
