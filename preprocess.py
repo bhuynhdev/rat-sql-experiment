@@ -415,9 +415,11 @@ class MyDataset(Dataset[DatasetItem]):
 
       assert isinstance(parse_result, Done), "Action sequence is incomplete!"
 
+      target_tokens = target_tokens + ["<END>"]
+
       self.block_size = max(self.block_size, len(input_seq))
       self.target_size = max(self.target_size, len(target_tokens))
-
+      
       target_sequence = torch.tensor(self.vocabs.action_vocab.encode(target_tokens), dtype=torch.int64)
       # Plus one to the tokenIds because we'll be using index 0 for None frontier field
       frontier_fields_idx = torch.Tensor([transition_system.grammar.field2id[f] + 1 if f else 0 for f in frontier_fields])
@@ -464,7 +466,7 @@ def get_global_block_size_and_tgt_size(train_dataset: MyDataset, val_dataset: My
 # Block size, target sequence, src vocab size, and target vocab size as hard-coded constants for ease of implementation
 # These numbers are found after running `get_global_block_size_and_tgt_size` and `get_vocab` isolatedly
 BLOCK_SIZE = 1309
-TGT_SIZE = 190
+TGT_SIZE = 191
 SRC_VOCAB_SIZE = 4195
 TGT_VOCAB_SIZE = 1638
 

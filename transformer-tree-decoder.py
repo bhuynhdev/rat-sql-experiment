@@ -342,17 +342,13 @@ def estimate_loss(model: Transformer1, train_dataloader: DataLoader[DatasetItem]
 
 def main():
   # Train
-  MODEL_NAME = "transform5-tranx"
+  MODEL_NAME = "transform6-tranx"
 
   ts = SpiderTransitionSystem("grammars/Spider2.asdl", output_from=True)
 
   m1 = Transformer1(transition_system=ts)
   print(f"Parameter count: {sum(dict((p.data_ptr(), p.numel()) for p in m1.parameters()).values())}") # https://stackoverflow.com/a/62764464
   m1 = m1.to(DEVICE)
-
-  # If a statedict already exists, we load that statedict so that it continues training from where it left off
-  if os.path.exists(f"{MODEL_NAME}.pt"):
-    m1.load_state_dict(torch.load(f"{MODEL_NAME}.pt")) # pyright: ignore[reportUnknownMemberType]
 
   print("BOOTSTRAPPING THE DATALOADER")
   train_dataset, _, train_dataloader, val_dataloader, vocabs = preprocess.everything()
@@ -375,56 +371,66 @@ def main():
   NOW = datetime.now()
 
   # Train the network
-  # Create an optimizer
-  # m1.train()
-  # optimizer = torch.optim.AdamW(m1.parameters(), lr=2.5e-4)
+  m1.train()
+  optimizer = torch.optim.AdamW(m1.parameters(), lr=2.5e-4)
 
-  # train_losses: list[tuple[int, float]] = []
-  # val_losses: list[tuple[int, float]] = []
-  # time_step_losses: list[tuple[int, float]] = [] # Record the losses of each time step
-  # MAX_ITER = 200
-  # for time_step in range(MAX_ITER):
-  #   try:
-  #     batch = next(train_dataloader_iter)
-  #   except StopIteration:
-  #     # Reset the dataloader
-  #     train_dataloader_iter = iter(train_dataloader)
-  #     batch = next(train_dataloader_iter)
-  #   input = batch.input.to(DEVICE)  # (B, block_size)
-  #   target = batch.target.to(DEVICE)  # (B, TGT_SIZE)
-  #   _, loss = m1(input, target)
-  #   optimizer.zero_grad(set_to_none=True)
-  #   loss.backward()
-  #   optimizer.step()
-  #   time_step_losses.append((time_step, loss.item()))
-  #   # For every 200 time steps we report the loss
-  #   if time_step % 50 == 0 or time_step == MAX_ITER - 1:
-  #     train_loss, val_loss = estimate_loss(m1, train_dataloader, val_dataloader, 24)
-  #     train_losses.append((time_step, train_loss.item()))
-  #     val_losses.append((time_step, val_loss.item()))
-  #     print(f"step {time_step}: train loss {train_loss.item():.4f}, val loss {val_loss.item():.4f}")
+  # If a statedict already exists, we load that statedict so that it continues training from where it left off
+  # if os.path.exists(f"{MODEL_NAME}.pt"):
+  #   saved_state = torch.load(f"{MODEL_NAME}.pt") # pyright: ignore[reportUnknownMemberType]
+  #   m1.load_state_dict(saved_state["state_dict"])
+  #   optimizer.load_state_dict(saved_state["optimizer"])
+  #   print(f"LOADED STATE DICT {MODEL_NAME}.pt")
 
-  # # After training
-  # # Save the model
-  # print("TRAINING FINISHED. SAVING THE MODEL")
-  # torch.save(m1.state_dict(), f"{MODEL_NAME}.pt") # pyright: ignore[reportUnknownMemberType]
+  train_losses: list[tuple[int, float]] = []
+  val_losses: list[tuple[int, float]] = []
+  time_step_losses: list[tuple[int, float]] = [] # Record the losses of each time step
+  MAX_ITER = 301
+  for time_step in range(MAX_ITER):
+    try:
+      batch = next(train_dataloader_iter)
+    except StopIteration:
+      # Reset the dataloader
+      train_dataloader_iter = iter(train_dataloader)
+      batch = next(train_dataloader_iter)
+    input = batch.input.to(DEVICE)  # (B, block_size)
+    target = batch.target.to(DEVICE)  # (B, TGT_SIZE)
+    _, loss = m1(input, target)
+    optimizer.zero_grad(set_to_none=True)
+    loss.backward()
+    optimizer.step()
+    time_step_losses.append((time_step, loss.item()))
+    # For every 200 time steps we report the loss
+    if time_step % 50 == 0 or time_step == MAX_ITER - 1:
+      train_loss, val_loss = estimate_loss(m1, train_dataloader, val_dataloader, 24)
+      train_losses.append((time_step, train_loss.item()))
+      val_losses.append((time_step, val_loss.item()))
+      print(f"step {time_step}: train loss {train_loss.item():.4f}, val loss {val_loss.item():.4f}")
 
-  # # Record the losses
-  # with open(f"{MODEL_NAME}-losses-{NOW.strftime('%y%m%d-%H%M')}.txt", "w") as f:
-  #   f.write("TIME STEP LOSS\n")
-  #   for time_step, loss in time_step_losses:
-  #     f.write(f"{time_step} {loss}\n")
-  #   f.write("MEAN TRAIN LOSS\n")
-  #   for time_step, loss in train_losses:
-  #     f.write(f"{time_step} {loss}\n")
-  #   f.write("MEAN VAL LOSS\n")
-  #   for time_step, loss in val_losses:
-  #     f.write(f"{time_step} {loss}\n")
+  # After training
+  # Save the model
+  print("TRAINING FINISHED. SAVING THE MODEL")
+  state = {'state_dict': m1.state_dict(), 'optimizer': optimizer.state_dict() }
+  torch.save(state, f"{MODEL_NAME}.pt") # pyright: ignore[reportUnknownMemberType]
 
+  print("RECORDING THE LOSSES")
+  # Record the losses
+  with open(f"{MODEL_NAME}-losses-{NOW.strftime('%y%m%d-%H%M')}.txt", "w") as f:
+    f.write("TIME STEP LOSS\n")
+    for time_step, loss in time_step_losses:
+      f.write(f"{time_step} {loss}\n")
+    f.write("MEAN TRAIN LOSS\n")
+    for time_step, loss in train_losses:
+      f.write(f"{time_step} {loss}\n")
+    f.write("MEAN VAL LOSS\n")
+    for time_step, loss in val_losses:
+      f.write(f"{time_step} {loss}\n")
+
+  print("INFERENCE AFTER TRAINING")
   # Inference
   m1_trained = Transformer1(transition_system=ts)
   m1_trained = m1_trained.to(DEVICE)
-  m1_trained.load_state_dict(torch.load(f"{MODEL_NAME}.pt")) # pyright: ignore[reportUnknownMemberType]
+  saved_state = torch.load(f"{MODEL_NAME}.pt") # pyright: ignore[reportUnknownMemberType]
+  m1_trained.load_state_dict(saved_state["state_dict"]) 
   m1_trained.eval()
 
   batch = next(train_dataloader_iter)

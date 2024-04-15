@@ -388,7 +388,7 @@ def main():
   train_losses: list[tuple[int, float]] = []
   val_losses: list[tuple[int, float]] = []
   time_step_losses: list[tuple[int, float]] = []  # Record the losses of each time step
-  MAX_ITER = 200
+  MAX_ITER = 501
   for time_step in range(MAX_ITER):
     try:
       batch = next(train_dataloader_iter)
