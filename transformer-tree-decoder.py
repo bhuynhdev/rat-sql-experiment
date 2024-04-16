@@ -10,7 +10,7 @@ from torch.utils.data import DataLoader
 import preprocess
 from preprocess import (BATCH_SIZE, BLOCK_SIZE, SRC_VOCAB_SIZE, TGT_SIZE,
                         TGT_VOCAB_SIZE, DatasetItem)
-from util import UnpackedSequential
+from util import UnpackedSequential, compare_models
 from grammars.spider_transition_system import SpiderTransitionSystem
 
 DROP_OUT = 0.2
@@ -20,6 +20,8 @@ if torch.backends.mps.is_available():
 if torch.cuda.is_available():
   device = "cuda"
 DEVICE = device
+
+TRANSITION_SYSTEM = SpiderTransitionSystem("grammars/Spider2.asdl", output_from=True)
 
 
 class SingleHeadAttention(nn.Module):
@@ -196,7 +198,7 @@ def compute_pos_encoding(block_size: int, d_model: int):
 
 
 class Transformer1(nn.Module):
-  def __init__(self, transition_system: SpiderTransitionSystem, emb_size: int = 256):
+  def __init__(self, emb_size: int = 256):
     """
     Parameters:
       emb_size: the size of each word embeddings. For example: GloVe embeddings is 300, BERT is 768
@@ -223,8 +225,8 @@ class Transformer1(nn.Module):
     self.decoder_hidden_size = emb_size * 3
     self.register_buffer("positional_embedding_tgt", compute_pos_encoding(TGT_SIZE, self.emb_size))
     self.decoder_token_emb = nn.Embedding(TGT_VOCAB_SIZE, emb_size, padding_idx=0)
-    self.decoder_field_emb = nn.Embedding(len(transition_system.grammar.fields) + 1, emb_size, padding_idx=0)
-    self.decoder_type_emb = nn.Embedding(len(transition_system.grammar.types) + 1, emb_size, padding_idx=0)
+    self.decoder_field_emb = nn.Embedding(len(TRANSITION_SYSTEM.grammar.fields) + 1, emb_size, padding_idx=0)
+    self.decoder_type_emb = nn.Embedding(len(TRANSITION_SYSTEM.grammar.types) + 1, emb_size, padding_idx=0)
     # Target language modeling head: Transform back from the embedding dimension to the tgt_vocab_size dimension
     # So that we can get the distribution and know which target token to choose
     self.tgt_lm_head = nn.Linear(self.emb_size, TGT_VOCAB_SIZE)
@@ -341,101 +343,111 @@ def estimate_loss(model: Transformer1, train_dataloader: DataLoader[DatasetItem]
     return train_loss, val_loss
 
 def main():
-  # Train
-  MODEL_NAME = "transform6-tranx"
-
-  ts = SpiderTransitionSystem("grammars/Spider2.asdl", output_from=True)
-
-  m1 = Transformer1(transition_system=ts)
-  print(f"Parameter count: {sum(dict((p.data_ptr(), p.numel()) for p in m1.parameters()).values())}") # https://stackoverflow.com/a/62764464
-  m1 = m1.to(DEVICE)
+  NOW = datetime.now()
+  MODEL_NAME = "transform6.5-tranx"
 
   print("BOOTSTRAPPING THE DATALOADER")
   train_dataset, _, train_dataloader, val_dataloader, vocabs = preprocess.everything()
-
-  m1.eval()
   train_dataloader_iter = iter(train_dataloader)
+
+
+  model = Transformer1()
+  print(f"Parameter count: {sum(dict((p.data_ptr(), p.numel()) for p in model.parameters()).values())}") # https://stackoverflow.com/a/62764464
+  model = model.to(DEVICE)
+
+
+  # If a statedict already exists, we load that statedict so that it continues training from where it left off
+  if os.path.exists(f"{MODEL_NAME}.pt"):
+    saved_state = torch.load(f"{MODEL_NAME}.pt.tar") # pyright: ignore[reportUnknownMemberType]
+    model.load_state_dict(saved_state["state_dict"])
+    print(f"LOADED STATE DICT {MODEL_NAME}.pt")
+
+  optimizer = torch.optim.AdamW(model.parameters(), lr=2.5e-4)
+
+  if os.path.exists(f"{MODEL_NAME}.pt"):
+    saved_state = torch.load(f"{MODEL_NAME}.pt") # pyright: ignore[reportUnknownMemberType]
+    optimizer.load_state_dict(saved_state["optimizer"])
+
   batch = next(train_dataloader_iter)
 
   print("SAMPLE GENERATING")
   # print(train_dataset[batch.id.tolist()[0]])
   print("Sample input", vocabs.src_vocab.decode(batch.input.tolist()[0]))
   print("Sample target", vocabs.action_vocab.decode(batch.target.tolist()[0]))
-
-  y_batch = m1.generate(batch.input.to(DEVICE))[0]
+  model.eval()
+  y_batch = model.generate(batch.input.to(DEVICE))[0]
   predicted = vocabs.action_vocab.decode(y_batch)
   print(predicted)
 
   
   print("START TRAINING")
-  NOW = datetime.now()
 
   # Train the network
-  m1.train()
-  optimizer = torch.optim.AdamW(m1.parameters(), lr=2.5e-4)
-
-  # If a statedict already exists, we load that statedict so that it continues training from where it left off
-  # if os.path.exists(f"{MODEL_NAME}.pt"):
-  #   saved_state = torch.load(f"{MODEL_NAME}.pt") # pyright: ignore[reportUnknownMemberType]
-  #   m1.load_state_dict(saved_state["state_dict"])
-  #   optimizer.load_state_dict(saved_state["optimizer"])
-  #   print(f"LOADED STATE DICT {MODEL_NAME}.pt")
-
-  train_losses: list[tuple[int, float]] = []
-  val_losses: list[tuple[int, float]] = []
-  time_step_losses: list[tuple[int, float]] = [] # Record the losses of each time step
-  MAX_ITER = 301
-  for time_step in range(MAX_ITER):
-    try:
-      batch = next(train_dataloader_iter)
-    except StopIteration:
-      # Reset the dataloader
-      train_dataloader_iter = iter(train_dataloader)
-      batch = next(train_dataloader_iter)
-    input = batch.input.to(DEVICE)  # (B, block_size)
-    target = batch.target.to(DEVICE)  # (B, TGT_SIZE)
-    _, loss = m1(input, target)
-    optimizer.zero_grad(set_to_none=True)
-    loss.backward()
-    optimizer.step()
-    time_step_losses.append((time_step, loss.item()))
-    # For every 200 time steps we report the loss
-    if time_step % 50 == 0 or time_step == MAX_ITER - 1:
-      train_loss, val_loss = estimate_loss(m1, train_dataloader, val_dataloader, 24)
-      train_losses.append((time_step, train_loss.item()))
-      val_losses.append((time_step, val_loss.item()))
-      print(f"step {time_step}: train loss {train_loss.item():.4f}, val loss {val_loss.item():.4f}")
+  # model.train()
+  
+  # train_losses: list[tuple[int, float]] = []
+  # val_losses: list[tuple[int, float]] = []
+  # time_step_losses: list[tuple[int, float]] = [] # Record the losses of each time step
+  # MAX_ITER = 51
+  # for time_step in range(MAX_ITER):
+  #   try:
+  #     batch = next(train_dataloader_iter)
+  #   except StopIteration:
+  #     # Reset the dataloader
+  #     train_dataloader_iter = iter(train_dataloader)
+  #     batch = next(train_dataloader_iter)
+  #   input = batch.input.to(DEVICE)  # (B, block_size)
+  #   target = batch.target.to(DEVICE)  # (B, TGT_SIZE)
+  #   _, loss = model(input, target)
+  #   optimizer.zero_grad(set_to_none=True)
+  #   loss.backward()
+  #   optimizer.step()
+  #   time_step_losses.append((time_step, loss.item()))
+  #   # For every 200 time steps we report the loss
+  #   if time_step % 50 == 0 or time_step == MAX_ITER - 1:
+  #     train_loss, val_loss = estimate_loss(model, train_dataloader, val_dataloader, 5)
+  #     train_losses.append((time_step, train_loss.item()))
+  #     val_losses.append((time_step, val_loss.item()))
+  #     print(f"step {time_step}: train loss {train_loss.item():.4f}, val loss {val_loss.item():.4f}")
 
   # After training
   # Save the model
-  print("TRAINING FINISHED. SAVING THE MODEL")
-  state = {'state_dict': m1.state_dict(), 'optimizer': optimizer.state_dict() }
-  torch.save(state, f"{MODEL_NAME}.pt") # pyright: ignore[reportUnknownMemberType]
+  # print("TRAINING FINISHED. SAVING THE MODEL")
+  # state = {'state_dict': model.state_dict(), 'optimizer': optimizer.state_dict() }
+  # torch.save(state, f"{MODEL_NAME}.pt") # pyright: ignore[reportUnknownMemberType]
 
-  print("RECORDING THE LOSSES")
-  # Record the losses
-  with open(f"{MODEL_NAME}-losses-{NOW.strftime('%y%m%d-%H%M')}.txt", "w") as f:
-    f.write("TIME STEP LOSS\n")
-    for time_step, loss in time_step_losses:
-      f.write(f"{time_step} {loss}\n")
-    f.write("MEAN TRAIN LOSS\n")
-    for time_step, loss in train_losses:
-      f.write(f"{time_step} {loss}\n")
-    f.write("MEAN VAL LOSS\n")
-    for time_step, loss in val_losses:
-      f.write(f"{time_step} {loss}\n")
+  # print("RECORDING THE LOSSES")
+  # # Record the losses
+  # with open(f"{MODEL_NAME}-losses-{NOW.strftime('%y%m%d-%H%M')}.txt", "w") as f:
+  #   f.write("TIME STEP LOSS\n")
+  #   for time_step, loss in time_step_losses:
+  #     f.write(f"{time_step} {loss}\n")
+  #   f.write("MEAN TRAIN LOSS\n")
+  #   for time_step, loss in train_losses:
+  #     f.write(f"{time_step} {loss}\n")
+  #   f.write("MEAN VAL LOSS\n")
+  #   for time_step, loss in val_losses:
+  #     f.write(f"{time_step} {loss}\n")
 
   print("INFERENCE AFTER TRAINING")
   # Inference
-  m1_trained = Transformer1(transition_system=ts)
+  m1_trained = Transformer1()
   m1_trained = m1_trained.to(DEVICE)
+
+
   saved_state = torch.load(f"{MODEL_NAME}.pt") # pyright: ignore[reportUnknownMemberType]
-  m1_trained.load_state_dict(saved_state["state_dict"]) 
+  m1_trained.load_state_dict(saved_state["state_dict"])
+
+  differences = compare_models(model, m1_trained)
+  print("DIFF", differences)
+
   m1_trained.eval()
 
   batch = next(train_dataloader_iter)
 
   y_batch = m1_trained.generate(batch.input.to(DEVICE), max_generated_tokens=TGT_SIZE)
+
+  # print(estimate_loss(m1_trained, train_dataloader, val_dataloader))
 
   # Print result to cmd (just first 2 batch)
   for i in range(2):
@@ -446,14 +458,14 @@ def main():
     print("Inference: Output words", vocabs.action_vocab.decode(y_batch[i]))
 
   # Write result as txt
-  with open(f"{MODEL_NAME}-result-{NOW.strftime('%y%m%d-%H%M')}.txt", "w") as f:
-    for i in range(BATCH_SIZE):
-      f.write(f"{i}\n")
-      f.write(f"input_words: {vocabs.src_vocab.decode(batch.input[i, :].tolist())}\n")
-      f.write(f"target_words: {vocabs.action_vocab.decode(batch.target[i, :].tolist())}\n")
-      f.write(f"target_tokens: {batch.target[i, :].tolist()}\n")
-      f.write(f"predicted_words: {vocabs.action_vocab.decode(y_batch[i])}\n")
-      f.write(f"predicted_tokens: {y_batch[i]}\n")
+  # with open(f"{MODEL_NAME}-result-{NOW.strftime('%y%m%d-%H%M')}.txt", "w") as f:
+  #   for i in range(BATCH_SIZE):
+  #     f.write(f"{i}\n")
+  #     f.write(f"input_words: {vocabs.src_vocab.decode(batch.input[i, :].tolist())}\n")
+  #     f.write(f"target_words: {vocabs.action_vocab.decode(batch.target[i, :].tolist())}\n")
+  #     f.write(f"target_tokens: {batch.target[i, :].tolist()}\n")
+  #     f.write(f"predicted_words: {vocabs.action_vocab.decode(y_batch[i])}\n")
+  #     f.write(f"predicted_tokens: {y_batch[i]}\n")
 
 if __name__ == "__main__":
   main()
