@@ -134,11 +134,16 @@ class SpiderItem:
 class Vocab:
   """Vocab class contains set all words in a vocab, with helper method for encode/decoding token <-> id"""
 
-  def __init__(self, name: str, items: list[str]):
+  def __init__(self, name: str, items: list[str], specials: list[str]):
     self.name = name
-    self.items = set(items)
-    self.tok_to_idx = {item: i for i, item in enumerate(items)}
-    self.idx_to_tok = {i: item for i, item in enumerate(items)}
+    self.items = set(items + specials)
+    # The specials token get indexed first so that their index is always 0, 1, 2
+    self.tok_to_idx = {item: i for i, item in enumerate(specials)}
+    self.idx_to_tok = {i: item for i, item in enumerate(specials)}
+    # The other tokens get sorted (for deterministic vocab) then indexed
+    for j, item in enumerate(sorted(items), start=len(specials)):
+      self.tok_to_idx[item] = j
+      self.idx_to_tok[j] = item
 
   def encode(self, words: list[str]) -> list[int]:
     """Encode an input word to a token id. Returns -1 if not exists ("UNK" token)"""
@@ -236,15 +241,15 @@ def create_vocabs(schema_lookup: dict[str, Database], train_qas: list[QAPair], v
 
   # All tokens to be used to create src_vocab
   # Note that the order matters, i.e. 0th element will have token_id 0
-  src_tokens = [PAD_TOKEN, "CLS"] + list(col_name_vocab | col_types | tbl_name_vocab | question_vocab)
-  src_vocab = Vocab("source", src_tokens)
+  src_tokens = list(col_name_vocab | col_types | tbl_name_vocab | question_vocab)
+  src_vocab = Vocab("source", src_tokens, specials=[PAD_TOKEN, "CLS"])
 
 
   # Now create the vocab of the decoder, which consists of the actions (ApplyRuleAction, ReduceAction, SpiderGenTokenAction)
   apply_rule_actions = [ApplyRuleAction(production) for production in transition_system.grammar.productions]
   reduce_action = [ReduceAction()]
-  action_tokens = [PAD_TOKEN, "<START>", "<END>"] + list(set([repr(a) for a in apply_rule_actions + reduce_action + all_actions_from_items]))
-  action_vocab = Vocab("target", action_tokens)
+  action_tokens = list(set([repr(a) for a in apply_rule_actions + reduce_action + all_actions_from_items]))
+  action_vocab = Vocab("target", action_tokens, specials=[PAD_TOKEN, "<START>", "<END>"])
 
   return AllVocabs(src_vocab, action_vocab)
 
@@ -336,6 +341,17 @@ def construct_input_parts(col_toks: list[list[str]], col_types: list[ColumnType]
   question_part: list[str] = ["CLS"] + ques_toks
 
   return (col_name_part, tbl_name_part, question_part)
+
+def classify_target_vocab(target_vocab: Vocab):
+  """Helper function to classify the target vocabs into tokens that are actions (ApplyRule/Reduce) vs primitive GenToken tokens"""
+  actions_tokens: list[int] = []
+  primitive_tokens: list[int] = []
+  for item in target_vocab.items:
+    if "ApplyRule" in item or "Reduce" in item:
+      actions_tokens.append(target_vocab.encode([item])[0])
+    elif "Primitive" in item:
+      primitive_tokens.append(target_vocab.encode([item])[0])
+  return (actions_tokens, primitive_tokens)
 
 
 class MyDataset(Dataset[DatasetItem]):
@@ -432,7 +448,8 @@ class MyDataset(Dataset[DatasetItem]):
 
       assert isinstance(parse_result, Done), "Action sequence is incomplete!"
 
-      target_tokens = target_tokens + ["<END>"]
+      target_tokens.append("<END>")
+      frontier_fields.append(None)
 
       self.block_size = max(self.block_size, len(input_seq))
       self.target_size = max(self.target_size, len(target_tokens))

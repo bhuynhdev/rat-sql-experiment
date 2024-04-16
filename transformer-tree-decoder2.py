@@ -229,7 +229,7 @@ def compute_pos_encoding(block_size: int, d_model: int):
 
 
 class Transformer1(nn.Module):
-  def __init__(self, transition_system: SpiderTransitionSystem, emb_size: int = 300):
+  def __init__(self, transition_system: SpiderTransitionSystem, action_loss_weight: torch.Tensor, emb_size: int = 300):
     """
     Parameters:
       emb_size: the size of each word embeddings. For example: GloVe embeddings is 300, BERT is 768
@@ -237,6 +237,7 @@ class Transformer1(nn.Module):
     super().__init__()  # pyright: ignore[reportUnknownMemberType]
     assert emb_size % 3 == 0
     self.emb_size = emb_size
+    self.action_loss_weight = action_loss_weight
     # 4 encoder blocks
     self.encoder_layers = nn.Sequential(
       EncoderBlock(emb_size, num_attention_heads=4),
@@ -309,30 +310,46 @@ class Transformer1(nn.Module):
     return y, loss
 
   def compute_loss(self, decoder_output: torch.Tensor, encoder_output: torch.Tensor, batch: ModelInput):
-    gen_or_copy_logprobs = self.gen_or_copy_predictor(decoder_output) # (B, T, 2)
-    assert not torch.isnan(gen_or_copy_logprobs).any()
+    # gen_or_copy_logprobs = self.gen_or_copy_predictor(decoder_output) # (B, T, 2)
+    # assert not torch.isnan(gen_or_copy_logprobs).any()
 
     # Calculate the loss of "Is the LLM generating the correct action"
     # Convert target embeddings to probability of taking each action in the vocab
     action_probs: torch.Tensor = self.tgt_lm_head(decoder_output)  # (B, T, C) where C = tgt_vocab_size
-    action_probs = action_probs.masked_fill(batch.action_mask == 0, value=float("-inf"))
+    # action_probs = action_probs.masked_fill(batch.action_mask.unsqueeze(-1) == 0, value=float("-inf"))
     assert action_probs.shape == (BATCH_SIZE, TGT_SIZE, TGT_VOCAB_SIZE)
+    # Cross_entropy requires the "Class" dimension to be the 2nd dimension
+    b, t, c = action_probs.shape
+    action_probs = action_probs.view(b * t, c)
+    target_actions = batch.target.view(b * t)
+    loss_action = F.cross_entropy(action_probs, target_actions, ignore_index=0, weight=self.action_loss_weight)
 
     # Do the cross entropy loss ourselves by gathering then logsoftmax
     # First: Use the value in the target action as indexes to gather the probabiity of that desired action from the action_probs tensor
-    target_action_prob = action_probs.gather(dim=2, index=batch.target.unsqueeze(-1)).squeeze(-1) # (B, T)
-    loss_action = F.log_softmax(target_action_prob, dim=1) # (B, T)
+    # target_action_prob = action_probs.gather(dim=2, index=batch.target.unsqueeze(-1)).squeeze(-1) # (B, T)
+    # assert target_action_prob.shape == (BATCH_SIZE, TGT_SIZE)
+    # print("HERE",target_action_prob)
+    # loss_action = F.log_softmax(target_action_prob, dim=1) # (B, T)
+    # assert not torch.isnan(loss_action).any()
 
     # Calculate the loss of "Is the LLM using the correct primitive"
     # Predict what primitive GenToken action to use at each time step
-    primitive_probs: torch.Tensor = self.primitive_lm_head(decoder_output) # (B, T, C)
-    primitive_probs.masked_fill(batch.copy_mask == 0, value = float("-inf"))
-    target_primitive_prob = primitive_probs.gather(dim=2, index=batch.primitive_seq.unsqueeze(-1)).squeeze(-1) # (B, T)
-    loss_primitive = F.log_softmax(target_primitive_prob, dim=1) # (B, T)
+    primitive_probs: torch.Tensor = self.primitive_lm_head(decoder_output) # (B, T, 7)
+    # primitive_probs.masked_fill(batch.copy_mask.unsqueeze(-1) == 0, value = float("-inf"))
+    assert primitive_probs.shape == (BATCH_SIZE, TGT_SIZE, PRIMITIVE_VOCAB_SIZE)
+    # target_primitive_prob = primitive_probs.gather(dim=2, index=batch.primitive_seq.unsqueeze(-1)).squeeze(-1) # (B, T)
+    # assert target_primitive_prob.shape == (BATCH_SIZE, TGT_SIZE)
+    # loss_primitive = F.log_softmax(target_primitive_prob, dim=1) # (B, T)
 
-    loss = loss_action + loss_primitive # (B, T)
-    loss = torch.logsumexp(loss, dim=0) # (T)
-    loss = loss.mean() # (B)
+    # Cross_entropy requires the "Class" dimension to be the 2nd dimension
+    b, t, c = primitive_probs.shape
+    primitive_probs = primitive_probs.view(b * t, c)
+    target_primitive_actions = batch.primitive_seq.view(b * t)
+    loss_primitive = F.cross_entropy(primitive_probs, target_primitive_actions, ignore_index=0)
+
+    print(f"{loss_action=} {loss_primitive=}")
+
+    loss = loss_action + loss_primitive
 
     # Calculate the loss of "Is the LLM copying the correct token"
     # copy_logits: torch.Tensor = self.pointer_network(query=decoder_output, keys=encoder_output) # (B, BLOCK_SIZE, 1)
@@ -402,11 +419,20 @@ def estimate_loss(model: Transformer1, train_dataloader: DataLoader[DatasetItem]
     # Training loss
     for i in range(loss_batch_size):
       try:
-        batch = next(train_dataloader_iter)
+        batch: ModelInput = next(train_dataloader_iter)
       except StopIteration:
         train_dataloader_iter = iter(train_dataloader)
         batch = next(train_dataloader_iter)
-      _, loss = model(batch.input.to(DEVICE), batch.target.to(DEVICE))
+      # Send all fields in the batch to CUDA
+      batch.input = batch.input.to(DEVICE)
+      batch.target = batch.target.to(DEVICE)
+      batch.action_mask = batch.action_mask.to(DEVICE)
+      batch.copy_mask = batch.copy_mask.to(DEVICE)
+      batch.copy_target_mask = batch.copy_target_mask.to(DEVICE)
+      batch.field_idx = batch.field_idx.to(DEVICE)
+      batch.type_idx = batch.type_idx.to(DEVICE)
+      batch.primitive_seq = batch.primitive_seq.to(DEVICE)
+      _, loss = model(batch)
       losses[i] = loss.item()
     train_loss = losses.mean()
 
@@ -418,7 +444,16 @@ def estimate_loss(model: Transformer1, train_dataloader: DataLoader[DatasetItem]
       except StopIteration:
         val_dataloader_iter = iter(val_dataloader)
         batch = next(val_dataloader_iter)
-      _, loss = model(batch.input.to(DEVICE), batch.target.to(DEVICE))
+      # Send all fields in the batch to CUDA
+      batch.input = batch.input.to(DEVICE)
+      batch.target = batch.target.to(DEVICE)
+      batch.action_mask = batch.action_mask.to(DEVICE)
+      batch.copy_mask = batch.copy_mask.to(DEVICE)
+      batch.copy_target_mask = batch.copy_target_mask.to(DEVICE)
+      batch.field_idx = batch.field_idx.to(DEVICE)
+      batch.type_idx = batch.type_idx.to(DEVICE)
+      batch.primitive_seq = batch.primitive_seq.to(DEVICE)
+      _, loss = model(batch)
       losses[i] = loss.item()
     val_loss = losses.mean()
 
@@ -432,12 +467,20 @@ def main():
 
   ts = SpiderTransitionSystem("grammars/Spider2.asdl", output_from=True)
 
-  m1 = Transformer1(transition_system=ts)
+  print("BOOTSTRAPPING THE DATALOADER")
+  train_dataset, _, train_dataloader, val_dataloader, vocabs = preprocess.everything()
+
+  _, primitive_tokens = preprocess.classify_target_vocab(vocabs.action_vocab)
+
+  # Create a weight tensor for the cross entropy loss calculation of the action loss
+  # i.e. every primitive_tokens should have weight 0 since they should not contribute to the action's cross entropy loss
+  action_loss_weight = torch.ones(TGT_VOCAB_SIZE)
+  action_loss_weight[primitive_tokens] = 0 # Set the elements at the specified indexes to 0
+
+  m1 = Transformer1(transition_system=ts, action_loss_weight=action_loss_weight)
   print(f"Parameter count: {sum(dict((p.data_ptr(), p.numel()) for p in m1.parameters()).values())}")  # https://stackoverflow.com/a/62764464
   m1 = m1.to(DEVICE)
 
-  print("BOOTSTRAPPING THE DATALOADER")
-  train_dataset, _, train_dataloader, val_dataloader, vocabs = preprocess.everything()
 
   m1.eval()
   train_dataloader_iter = iter(train_dataloader)
@@ -485,6 +528,7 @@ def main():
     batch.copy_target_mask = batch.copy_target_mask.to(DEVICE)
     batch.field_idx = batch.field_idx.to(DEVICE)
     batch.type_idx = batch.type_idx.to(DEVICE)
+    batch.primitive_seq = batch.primitive_seq.to(DEVICE)
     
     _, loss = m1(batch)
     optimizer.zero_grad(set_to_none=True)
@@ -517,7 +561,7 @@ def main():
       f.write(f"{time_step} {loss}\n")
 
   # Inference
-  m1_trained = Transformer1(transition_system=ts)
+  m1_trained = Transformer1(transition_system=ts, action_loss_weight=action_loss_weight)
   m1_trained = m1_trained.to(DEVICE)
   saved_state = torch.load(f"{MODEL_NAME}.pt") # pyright: ignore[reportUnknownMemberType]
   m1_trained.load_state_dict(saved_state["state_dict"]) 
