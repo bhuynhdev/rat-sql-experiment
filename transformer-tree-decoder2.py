@@ -9,7 +9,7 @@ from torch.utils.data import DataLoader
 
 import preprocess
 from preprocess import (BATCH_SIZE, BLOCK_SIZE, SRC_VOCAB_SIZE, TGT_SIZE,
-                        TGT_VOCAB_SIZE, DatasetItem, ModelInput)
+                        TGT_VOCAB_SIZE, PRIMITIVE_VOCAB_SIZE, DatasetItem, ModelInput)
 from util import UnpackedSequential
 from grammars.spider_transition_system import SpiderTransitionSystem
 
@@ -146,6 +146,39 @@ class PositionWiseFeedForward(nn.Module):
 
   def forward(self, x: torch.Tensor):
     return self.feed_forward(x)
+  
+class BahdanauPointer(nn.Module):
+    """A simple cross-attention layer to calculate how the query correlates with the key
+    Will be used to know which position in the input to copy from
+    Use the Bahdanau Additive Attention equation: https://arxiv.org/pdf/1508.04025.pdf
+    Credit: https://github.dev/ServiceNow/duorat
+    """
+    def __init__(self, query_size: int, key_size: int, proj_size: int) -> None:
+        super().__init__()
+        self.compute_scores = torch.nn.Sequential(
+            torch.nn.Linear(query_size + key_size, proj_size),
+            torch.nn.Tanh(),
+            torch.nn.Linear(proj_size, 1),
+        )
+
+    def forward(
+        self,
+        query: torch.Tensor,
+        keys: torch.Tensor,
+    ) -> torch.Tensor:
+        # query shape: batch x seq_len x query_size
+        # keys shape: batch x mem_len x key_size
+
+        # query_expanded shape: batch x num keys x query_size
+        query_expanded = query.unsqueeze(2).expand(-1, -1, keys.shape[1], -1)
+        keys_expanded = keys.unsqueeze(1).expand(-1, query.shape[1], -1, -1)
+
+        # scores shape: batch x num keys x 1
+        attn_logits = self.compute_scores(
+            # shape: batch x num keys x query_size + key_size 
+            torch.cat((query_expanded, keys_expanded), dim=3)
+        )
+        return attn_logits
 
 
 class EncoderBlock(nn.Module):
@@ -166,14 +199,14 @@ class EncoderBlock(nn.Module):
 
 
 class DecoderBlock(nn.Module):
-  def __init__(self, emb_size: int, num_attention_heads: int):
+  def __init__(self, decoder_emb_size: int, num_attention_heads: int):
     super().__init__()  # pyright: ignore[reportUnknownMemberType]
-    self.masked_self_attention = MultiHeadAttention(emb_size, num_attention_heads, is_masked=False)
-    self.cross_attention = MultiHeadCrossAttention(emb_size, num_attention_heads, is_masked=False)
-    self.feed_forward = PositionWiseFeedForward(emb_size)
-    self.layer_norm1 = nn.LayerNorm(emb_size)  # Layer norm for the masked-self-attention sublayer
-    self.layer_norm2 = nn.LayerNorm(emb_size)  # Layer norm for the cross-attention sublayer
-    self.layer_norm3 = nn.LayerNorm(emb_size)  # Layer norm for the feed-forward sublayer
+    self.masked_self_attention = MultiHeadAttention(decoder_emb_size, num_attention_heads, is_masked=False)
+    self.cross_attention = MultiHeadCrossAttention(decoder_emb_size, num_attention_heads, is_masked=False)
+    self.feed_forward = PositionWiseFeedForward(decoder_emb_size)
+    self.layer_norm1 = nn.LayerNorm(decoder_emb_size)  # Layer norm for the masked-self-attention sublayer
+    self.layer_norm2 = nn.LayerNorm(decoder_emb_size)  # Layer norm for the cross-attention sublayer
+    self.layer_norm3 = nn.LayerNorm(decoder_emb_size)  # Layer norm for the feed-forward sublayer
 
   def forward(self, x: torch.Tensor, encoder_embedding: torch.Tensor):
     x = x + self.masked_self_attention(self.layer_norm1(x))
@@ -196,12 +229,13 @@ def compute_pos_encoding(block_size: int, d_model: int):
 
 
 class Transformer1(nn.Module):
-  def __init__(self, transition_system: SpiderTransitionSystem, emb_size: int = 256):
+  def __init__(self, transition_system: SpiderTransitionSystem, emb_size: int = 300):
     """
     Parameters:
       emb_size: the size of each word embeddings. For example: GloVe embeddings is 300, BERT is 768
     """
     super().__init__()  # pyright: ignore[reportUnknownMemberType]
+    assert emb_size % 3 == 0
     self.emb_size = emb_size
     # 4 encoder blocks
     self.encoder_layers = nn.Sequential(
@@ -220,19 +254,29 @@ class Transformer1(nn.Module):
 
     # DECODER COMPONENTS
     # Input to the decoder concists of emb of prev action + emb frontier field + emb frontier type
-    self.decoder_hidden_size = emb_size * 3
-    self.register_buffer("positional_embedding_tgt", compute_pos_encoding(TGT_SIZE, self.decoder_hidden_size))
-    self.decoder_token_emb = nn.Embedding(TGT_VOCAB_SIZE, emb_size, padding_idx=0)
-    self.decoder_field_emb = nn.Embedding(len(transition_system.grammar.fields) + 1, emb_size, padding_idx=0)
-    self.decoder_type_emb = nn.Embedding(len(transition_system.grammar.types) + 1, emb_size, padding_idx=0)
+    self.decoder_hidden_size = emb_size
+    self.register_buffer("positional_embedding_tgt", compute_pos_encoding(TGT_SIZE, self.emb_size // 3))
+    self.decoder_token_emb = nn.Embedding(TGT_VOCAB_SIZE, emb_size // 3, padding_idx=0)
+    self.decoder_field_emb = nn.Embedding(len(transition_system.grammar.fields) + 1, emb_size // 3, padding_idx=0)
+    self.decoder_type_emb = nn.Embedding(len(transition_system.grammar.types) + 1, emb_size //3 , padding_idx=0)
+
+    # A simple Linear layer that, given a time step's hidden state, predicts whether to copy token or to take action
+    self.gen_or_copy_predictor = nn.Sequential(
+        nn.Linear(in_features=self.decoder_hidden_size, out_features=2),
+        nn.LogSoftmax(dim=-1),
+    )
+
+    # A pointer network to see which input location to attend to/copy from
+    self.pointer_network = BahdanauPointer(emb_size, self.decoder_hidden_size, 50)
     # Target language modeling head: Transform back from the embedding dimension to the tgt_vocab_size dimension
     # So that we can get the distribution and know which target token to choose
-    self.tgt_lm_head = nn.Linear(self.emb_size, TGT_VOCAB_SIZE)
+    self.tgt_lm_head = nn.Linear(self.decoder_hidden_size, TGT_VOCAB_SIZE)
+    self.primitive_lm_head = nn.Linear(self.decoder_hidden_size, PRIMITIVE_VOCAB_SIZE)
     self.decoder_layers = UnpackedSequential(
-      DecoderBlock(emb_size, num_attention_heads=4),
-      DecoderBlock(emb_size, num_attention_heads=4),
-      DecoderBlock(emb_size, num_attention_heads=4),
-      DecoderBlock(emb_size, num_attention_heads=4),
+      DecoderBlock(self.decoder_hidden_size, num_attention_heads=4),
+      DecoderBlock(self.decoder_hidden_size, num_attention_heads=4),
+      DecoderBlock(self.decoder_hidden_size, num_attention_heads=4),
+      DecoderBlock(self.decoder_hidden_size, num_attention_heads=4),
     )
 
   def forward(self, batch: ModelInput):
@@ -242,25 +286,58 @@ class Transformer1(nn.Module):
     """
     # First, encode
     encoder_emb = self.encode(batch.input)  # (B, T, E)
+    # Then decode
+    # Decoder input = emb of prev action + emb frontier field + emb frontier type
     # Shift right the target_idx to add the <START> token
     start_tokens = torch.ones((BATCH_SIZE, 1), device=DEVICE, dtype=torch.int64)
+    start_frontier_field_tokens = torch.zeros((BATCH_SIZE, 1), device=DEVICE, dtype=torch.int64) # 0s for None frontier field
+    start_frontier_type_tokens = torch.zeros((BATCH_SIZE, 1), device=DEVICE, dtype=torch.int64) # 0s for None frontier type
     shifted_input = torch.cat((start_tokens, batch.target[:, :-1]), dim=1)
-    # Now, decode
-    y, _ = self.decode(encoder_emb, shifted_input)
-    loss = self.compute_loss(y, batch)
+    shifted_frontier_field = torch.cat((start_frontier_field_tokens, batch.field_idx[:, :-1]), dim=1)
+    shifted_frontier_type = torch.cat((start_frontier_type_tokens, batch.type_idx[:, :-1]), dim=1)
+
+    decoder_action_emb = self.decoder_token_emb(shifted_input) # (B, T, E)
+    decoder_pos_emb = self.positional_embedding_tgt # (B, T, E)
+    decoder_field_emb = self.decoder_field_emb(shifted_frontier_field)
+    decoder_type_emb = self.decoder_type_emb(shifted_frontier_type)
+    decoder_input = torch.cat((decoder_action_emb + decoder_pos_emb, decoder_field_emb, decoder_type_emb), dim=-1)
+
+    assert decoder_input.shape == (BATCH_SIZE, TGT_SIZE, self.decoder_hidden_size)
+    # "memory" is bascially encoder_ouput that is remembered/cached/re-used throughout all decoder calculation
+    y, memory = self.decode(encoder_emb, decoder_input)
+    loss = self.compute_loss(y, memory, batch)
     return y, loss
 
-  def compute_loss(self, decoder_output: torch.Tensor, batch: ModelInput):
-    target_idx = batch.target
-    # Convert target embeddings to target probs
-    predicted_target_probs = self.tgt_lm_head(decoder_output)  # (B, T, C) where C = tgt_vocab_size
-    assert predicted_target_probs.shape == (BATCH_SIZE, TGT_SIZE, TGT_VOCAB_SIZE)
-    # Cross_entropy requires the "Class" dimension to be the 2nd dimension
-    B, T, C = predicted_target_probs.shape
-    predicted_target_probs = predicted_target_probs.view(B * T, C)
-    target_idx = target_idx.view(B * T)
-    # Calculate loss
-    loss = F.cross_entropy(predicted_target_probs, target_idx, ignore_index=0)
+  def compute_loss(self, decoder_output: torch.Tensor, encoder_output: torch.Tensor, batch: ModelInput):
+    gen_or_copy_logprobs = self.gen_or_copy_predictor(decoder_output) # (B, T, 2)
+    assert not torch.isnan(gen_or_copy_logprobs).any()
+
+    # Calculate the loss of "Is the LLM generating the correct action"
+    # Convert target embeddings to probability of taking each action in the vocab
+    action_probs: torch.Tensor = self.tgt_lm_head(decoder_output)  # (B, T, C) where C = tgt_vocab_size
+    action_probs = action_probs.masked_fill(batch.action_mask == 0, value=float("-inf"))
+    assert action_probs.shape == (BATCH_SIZE, TGT_SIZE, TGT_VOCAB_SIZE)
+
+    # Do the cross entropy loss ourselves by gathering then logsoftmax
+    # First: Use the value in the target action as indexes to gather the probabiity of that desired action from the action_probs tensor
+    target_action_prob = action_probs.gather(dim=2, index=batch.target.unsqueeze(-1)).squeeze(-1) # (B, T)
+    loss_action = F.log_softmax(target_action_prob, dim=1) # (B, T)
+
+    # Calculate the loss of "Is the LLM using the correct primitive"
+    # Predict what primitive GenToken action to use at each time step
+    primitive_probs: torch.Tensor = self.primitive_lm_head(decoder_output) # (B, T, C)
+    primitive_probs.masked_fill(batch.copy_mask == 0, value = float("-inf"))
+    target_primitive_prob = primitive_probs.gather(dim=2, index=batch.primitive_seq.unsqueeze(-1)).squeeze(-1) # (B, T)
+    loss_primitive = F.log_softmax(target_primitive_prob, dim=1) # (B, T)
+
+    loss = loss_action + loss_primitive # (B, T)
+    loss = torch.logsumexp(loss, dim=0) # (T)
+    loss = loss.mean() # (B)
+
+    # Calculate the loss of "Is the LLM copying the correct token"
+    # copy_logits: torch.Tensor = self.pointer_network(query=decoder_output, keys=encoder_output) # (B, BLOCK_SIZE, 1)
+    # copy_logits.masked_fill(batch.copy_target_mask == 0, value=float("-inf")) # (B, BLOCK_SIZE, 1)
+    # copy_logprobs = F.log_softmax(copy_logits, dim=2) # (B, BLOCK_SIZE, 1)
     return loss
 
   def encode(self, input_batch: torch.Tensor):
@@ -274,13 +351,8 @@ class Transformer1(nn.Module):
     x = self.encoder_layers(x)
     return x
 
-  def decode(self, encoder_emb: torch.Tensor, target_batch: torch.Tensor):
-    # Target batch should be of shape (B, T) (i.e (batch_size, target_size))
-    token_emb = self.decoder_token_emb(target_batch)  # (B, T, E) where E=emb_size
-    position_emb = self.positional_embedding_tgt  # (T, E)
-    y = token_emb + position_emb
-    assert y.shape == (BATCH_SIZE, TGT_SIZE, self.emb_size)
-    y = self.decoder_layers((y, encoder_emb))  # (B, T, E)
+  def decode(self, encoder_emb: torch.Tensor, decoder_input: torch.Tensor):
+    y = self.decoder_layers((decoder_input, encoder_emb))  # (B, T, E)
     return y
 
   def generate(self, input_idx: torch.Tensor, max_generated_tokens: int = 45):
@@ -290,12 +362,19 @@ class Transformer1(nn.Module):
       # Feed the <START> token as the first chosen token to the entire batch
       # The <START> token has index 1
       target_tokens = torch.ones((BATCH_SIZE, 1), device=DEVICE, dtype=torch.int64)  # (B)
+      field_tokens = torch.zeros((BATCH_SIZE, 1), device=DEVICE, dtype=torch.int64)
+      type_tokens = torch.zeros((BATCH_SIZE, 1), device=DEVICE, dtype=torch.int64) 
       target_tokens = torch.nn.functional.pad(target_tokens, (0, TGT_SIZE - target_tokens.size(1)), value=0)
+      field_tokens = torch.nn.functional.pad(field_tokens, (0, TGT_SIZE - field_tokens.size(1)), value=0)
+      type_tokens = torch.nn.functional.pad(type_tokens, (0, TGT_SIZE - type_tokens.size(1)), value=0)
       for i in range(max_generated_tokens):
         assert target_tokens.shape == (BATCH_SIZE, TGT_SIZE), f"Expected {(BATCH_SIZE, TGT_SIZE)} got {target_tokens.shape}"
-        token_emb = self.decoder_token_emb(target_tokens)  # (B, T, E) where E=emb_size
+        decoder_emb = self.decoder_token_emb(target_tokens)  # (B, T, E) where E=decoder_hidden_size
         position_emb = self.positional_embedding_tgt  # (T, E)
-        y = token_emb + position_emb
+        field_emb = self.decoder_field_emb(field_tokens)
+        type_emb = self.decoder_type_emb(type_tokens)
+        y = decoder_emb + position_emb
+        y = torch.cat((y, field_emb, type_emb), dim=-1)
         assert y.shape == (BATCH_SIZE, TGT_SIZE, self.emb_size)
         y, _ = self.decoder_layers((y, encoder_emb))
         tgt_probs = self.tgt_lm_head(y)  # (B, T, C) where C = tgt_vocab_size
@@ -349,17 +428,13 @@ def estimate_loss(model: Transformer1, train_dataloader: DataLoader[DatasetItem]
 
 def main():
   # Train
-  MODEL_NAME = "transform5-tranx"
+  MODEL_NAME = "transform7-tranx"
 
   ts = SpiderTransitionSystem("grammars/Spider2.asdl", output_from=True)
 
   m1 = Transformer1(transition_system=ts)
   print(f"Parameter count: {sum(dict((p.data_ptr(), p.numel()) for p in m1.parameters()).values())}")  # https://stackoverflow.com/a/62764464
   m1 = m1.to(DEVICE)
-
-  # If a statedict already exists, we load that statedict so that it continues training from where it left off
-  if os.path.exists(f"{MODEL_NAME}.pt"):
-    m1.load_state_dict(torch.load(f"{MODEL_NAME}.pt"))  # pyright: ignore[reportUnknownMemberType]
 
   print("BOOTSTRAPPING THE DATALOADER")
   train_dataset, _, train_dataloader, val_dataloader, vocabs = preprocess.everything()
@@ -381,9 +456,15 @@ def main():
   NOW = datetime.now()
 
   # Train the network
-  # Create an optimizer
   m1.train()
   optimizer = torch.optim.AdamW(m1.parameters(), lr=2.5e-4)
+
+  # If a statedict already exists, we load that statedict so that it continues training from where it left off
+  if os.path.exists(f"{MODEL_NAME}.pt"):
+    saved_state = torch.load(f"{MODEL_NAME}.pt") # pyright: ignore[reportUnknownMemberType]
+    m1.load_state_dict(saved_state["state_dict"])
+    optimizer.load_state_dict(saved_state["optimizer"])
+    print(f"LOADED STATE DICT {MODEL_NAME}.pt")
 
   train_losses: list[tuple[int, float]] = []
   val_losses: list[tuple[int, float]] = []
@@ -420,7 +501,9 @@ def main():
   # After training
   # Save the model
   print("TRAINING FINISHED. SAVING THE MODEL")
-  torch.save(m1.state_dict(), f"{MODEL_NAME}.pt")  # pyright: ignore[reportUnknownMemberType]
+  state = {'state_dict': m1.state_dict(), 'optimizer': optimizer.state_dict() }
+  torch.save(state, f"{MODEL_NAME}.pt") # pyright: ignore[reportUnknownMemberType]
+
   # Record the losses
   with open(f"{MODEL_NAME}-losses-{NOW.strftime('%y%m%d-%H%M')}.txt", "w") as f:
     f.write("TIME STEP LOSS\n")
@@ -436,32 +519,32 @@ def main():
   # Inference
   m1_trained = Transformer1(transition_system=ts)
   m1_trained = m1_trained.to(DEVICE)
-  m1_trained.load_state_dict(torch.load(f"{MODEL_NAME}.pt"))  # pyright: ignore[reportUnknownMemberType]
+  saved_state = torch.load(f"{MODEL_NAME}.pt") # pyright: ignore[reportUnknownMemberType]
+  m1_trained.load_state_dict(saved_state["state_dict"]) 
   m1_trained.eval()
 
   batch = next(train_dataloader_iter)
 
-
-  input_seq, target_seq = batch
-  y_batch = m1_trained.generate(input_seq.to(DEVICE), max_generated_tokens=TGT_SIZE)
+  y_batch = m1_trained.generate(batch.input.to(DEVICE), max_generated_tokens=TGT_SIZE)
 
   # Print result to cmd (just first 2 batch)
   for i in range(2):
-    print("Inference: Input words", preprocess.toks_decode(input_seq.tolist()[i], token_lookup_tables, 'source'))  # type: ignore
-    print("Inference: Target tokens", target_seq.tolist()[i])  # type: ignore
-    print("Inference: Target words", preprocess.toks_decode(target_seq.tolist()[i], token_lookup_tables, 'target'))  # type: ignore
+    print("Inference: Input words", vocabs.src_vocab.decode(batch.input.tolist()[i]))
+    print("Inference: Target tokens", batch.target.tolist()[i])
+    print("Inference: Target words", vocabs.action_vocab.decode(batch.target.tolist()[i]))
     print("Inference: Output tokens", y_batch[i])
-    print("Inference: Output words", preprocess.toks_decode(y_batch[i], token_lookup_tables, "target"))
+    print("Inference: Output words", vocabs.action_vocab.decode(y_batch[i]))
 
   # Write result as txt
   with open(f"{MODEL_NAME}-result-{NOW.strftime('%y%m%d-%H%M')}.txt", "w") as f:
     for i in range(BATCH_SIZE):
       f.write(f"{i}\n")
-      f.write(f"input_words: {preprocess.toks_decode(input_seq[i, :].tolist(), token_lookup_tables, 'source')}\n")  # type: ignore
-      f.write(f"target_words: {preprocess.toks_decode(target_seq[i, :].tolist(), token_lookup_tables, 'target')}\n")  # type: ignore
-      f.write(f"target_tokens: {target_seq[i, :].tolist()}\n")  # type: ignore
-      f.write(f"predicted_words: {preprocess.toks_decode(y_batch[i], token_lookup_tables, 'target')}\n")  # type: ignore
+      f.write(f"input_words: {vocabs.src_vocab.decode(batch.input[i, :].tolist())}\n")
+      f.write(f"target_words: {vocabs.action_vocab.decode(batch.target[i, :].tolist())}\n")
+      f.write(f"target_tokens: {batch.target[i, :].tolist()}\n")
+      f.write(f"predicted_words: {vocabs.action_vocab.decode(y_batch[i])}\n")
       f.write(f"predicted_tokens: {y_batch[i]}\n")
+
 
 
 if __name__ == "__main__":
