@@ -474,7 +474,7 @@ def main():
 
   # Create a weight tensor for the cross entropy loss calculation of the action loss
   # i.e. every primitive_tokens should have weight 0 since they should not contribute to the action's cross entropy loss
-  action_loss_weight = torch.ones(TGT_VOCAB_SIZE)
+  action_loss_weight = torch.ones(TGT_VOCAB_SIZE, device=DEVICE)
   action_loss_weight[primitive_tokens] = 0 # Set the elements at the specified indexes to 0
 
   m1 = Transformer1(transition_system=ts, action_loss_weight=action_loss_weight)
@@ -529,7 +529,6 @@ def main():
     batch.field_idx = batch.field_idx.to(DEVICE)
     batch.type_idx = batch.type_idx.to(DEVICE)
     batch.primitive_seq = batch.primitive_seq.to(DEVICE)
-    
     _, loss = m1(batch)
     optimizer.zero_grad(set_to_none=True)
     loss.backward()
