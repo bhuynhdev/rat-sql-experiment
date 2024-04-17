@@ -157,25 +157,35 @@ class SpiderTransitionSystem(TransitionSystem):
     asdl_ast.sanity_check()
     return asdl_ast
 
-  # def get_valid_continuation_types(self, hyp) -> Tuple[Type[Action], ...]:
-  #     if hyp.tree:
-  #         if self.grammar.is_composite_type(hyp.frontier_field.type):
-  #             if hyp.frontier_field.cardinality == "single":
-  #                 return (ApplyRuleAction,)
-  #             else:  # optional, multiple
-  #                 return ApplyRuleAction, ReduceAction
-  #         else:
-  #             if hyp.frontier_field.cardinality == "single":
-  #                 return (SpiderGenTokenAction,)
-  #             elif hyp.frontier_field.cardinality == "optional":
-  #                 if hyp._value_buffer:
-  #                     return (SpiderGenTokenAction,)
-  #                 else:
-  #                     return SpiderGenTokenAction, ReduceAction
-  #             else:
-  #                 return SpiderGenTokenAction, ReduceAction
-  #     else:
-  #         return (ApplyRuleAction,)
+  def get_valid_continuation_types(self, hyp) -> Tuple[Type[Action], ...]:
+      if hyp.tree:
+          if self.grammar.is_composite_type(hyp.frontier_field.type):
+              if hyp.frontier_field.cardinality == "single":
+                  return (ApplyRuleAction,)
+              else:  # optional, multiple
+                  return ApplyRuleAction, ReduceAction
+          else:
+              if hyp.frontier_field.cardinality == "single":
+                  return (SpiderGenTokenAction,)
+              elif hyp.frontier_field.cardinality == "optional":
+                  if hyp._value_buffer:
+                      return (SpiderGenTokenAction,)
+                  else:
+                      return SpiderGenTokenAction, ReduceAction
+              else:
+                  return SpiderGenTokenAction, ReduceAction
+      else:
+          return (ApplyRuleAction,)
+
+  def get_valid_continuating_productions(self, hyp):
+    if hyp.tree:
+        if self.grammar.is_composite_type(hyp.frontier_field.type):
+            return self.grammar[hyp.frontier_field.type]
+        else:
+            raise ValueError
+    else:
+        return self.grammar[self.grammar.root_type]
+
 
   # def _tokenize(self, s: str) -> List[str]:
   #     # FIXME: dirty hack
@@ -414,13 +424,38 @@ def main():
   # gen_tok_acts = [ts.get_gen_token_action(a)(num) for a in ts.grammar.primitive_types for num in range(10)]
   # # print("ACTIONS?", a2s(ts.grammar.composite_types))
 
-  schema_lookup = create_database_schemas("spider/tables.json")
-  _, _, train_items, _ = create_training_items(
-    "spider/train_spider.json", "spider/dev.json", schema_lookup
-  )
-  query = train_items[4].qa_pair.sql_tree
-  for field in ts.grammar.field2id:
-    print(field, ts.grammar.field2id[field])
+  # schema_lookup = create_database_schemas("spider/tables.json")
+  # _, _, train_items, _ = create_training_items(
+  #   "spider/train_spider.json", "spider/dev.json", schema_lookup
+  # )
+  h = Hypothesis()
+  hs = [h]
+  new_hyp_meta = []
+  for h_id, hyp in enumerate(hs):
+    action_types = ts.get_valid_continuation_types(hyp)
+    for action_type in action_types:
+      if action_type == ApplyRuleAction:
+          productions = ts.get_valid_continuating_productions(hyp)
+          for production in productions:
+              # Convert production to token id
+              prod_id = ts.grammar.prod2id[production]
+              prod_score = 0.12
+              new_hyp_score = hyp.score + prod_score
+
+              meta_entry = {'action_type': 'apply_rule', 'prod_id': prod_id,
+                            'score': prod_score, 'new_hyp_score': new_hyp_score,
+                            'prev_hyp_id': h_id}
+              new_hyp_meta.append(meta_entry)
+      elif action_type == ReduceAction:
+          action_score = 0.25
+          new_hyp_score = hyp.score + action_score
+
+          meta_entry = {'action_type': 'apply_rule', 'prod_id': 5000,
+                        'score': action_score, 'new_hyp_score': new_hyp_score,
+                        'prev_hyp_id': h_id}
+          new_hyp_meta.append(meta_entry)
+
+  print(new_hyp_meta)
 
 
 if __name__ == "__main__":

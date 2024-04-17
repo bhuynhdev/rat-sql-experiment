@@ -443,8 +443,8 @@ class MyDataset(Dataset[DatasetItem]):
             if word_position_in_input: 
               copy_target_mask[word_position_in_input] = 1
           else:
-            raise Exception(f"Unhandled action {action} from statement {item.qa_pair.question}:{
-                            item.qa_pair.query}\ntree {'\n'.join(map(repr, target_actions))}")
+            newline = "\n"
+            raise Exception(f"Unhandled action {action} from statement {item.qa_pair.question}:{item.qa_pair.query}{newline}tree {newline.join(map(repr, target_actions))}")
 
       assert isinstance(parse_result, Done), "Action sequence is incomplete!"
 

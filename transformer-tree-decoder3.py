@@ -8,7 +8,7 @@ from torch.nn import functional as F
 from torch.utils.data import DataLoader
 
 import preprocess
-from preprocess import (BATCH_SIZE, BLOCK_SIZE, SRC_VOCAB_SIZE, TGT_SIZE,
+from preprocess import (BLOCK_SIZE, SRC_VOCAB_SIZE, TGT_SIZE,
                         TGT_VOCAB_SIZE, PRIMITIVE_VOCAB_SIZE, DatasetItem, ModelInput)
 from util import UnpackedSequential
 from grammars.spider_transition_system import SpiderTransitionSystem
@@ -237,6 +237,7 @@ class Transformer1(nn.Module):
     super().__init__()  # pyright: ignore[reportUnknownMemberType]
     assert emb_size % 3 == 0
     self.emb_size = emb_size
+    self.transition_system = transition_system
     self.action_loss_weight = action_loss_weight
     # 4 encoder blocks
     self.encoder_layers = nn.Sequential(
@@ -287,12 +288,13 @@ class Transformer1(nn.Module):
     """
     # First, encode
     encoder_emb = self.encode(batch.input)  # (B, T, E)
+    batch_size = batch.input.shape[0]
     # Then decode
     # Decoder input = emb of prev action + emb frontier field + emb frontier type
     # Shift right the target_idx to add the <START> token
-    start_tokens = torch.ones((BATCH_SIZE, 1), device=DEVICE, dtype=torch.int64)
-    start_frontier_field_tokens = torch.zeros((BATCH_SIZE, 1), device=DEVICE, dtype=torch.int64) # 0s for None frontier field
-    start_frontier_type_tokens = torch.zeros((BATCH_SIZE, 1), device=DEVICE, dtype=torch.int64) # 0s for None frontier type
+    start_tokens = torch.ones((batch_size, 1), device=DEVICE, dtype=torch.int64)
+    start_frontier_field_tokens = torch.zeros((batch_size, 1), device=DEVICE, dtype=torch.int64) # 0s for None frontier field
+    start_frontier_type_tokens = torch.zeros((batch_size, 1), device=DEVICE, dtype=torch.int64) # 0s for None frontier type
     shifted_input = torch.cat((start_tokens, batch.target[:, :-1]), dim=1)
     shifted_frontier_field = torch.cat((start_frontier_field_tokens, batch.field_idx[:, :-1]), dim=1)
     shifted_frontier_type = torch.cat((start_frontier_type_tokens, batch.type_idx[:, :-1]), dim=1)
@@ -303,7 +305,7 @@ class Transformer1(nn.Module):
     decoder_type_emb = self.decoder_type_emb(shifted_frontier_type)
     decoder_input = torch.cat((decoder_action_emb + decoder_pos_emb, decoder_field_emb, decoder_type_emb), dim=-1)
 
-    assert decoder_input.shape == (BATCH_SIZE, TGT_SIZE, self.decoder_hidden_size)
+    assert decoder_input.shape == (batch_size, TGT_SIZE, self.decoder_hidden_size)
     # "memory" is bascially encoder_ouput that is remembered/cached/re-used throughout all decoder calculation
     y, memory = self.decode(encoder_emb, decoder_input)
     loss = self.compute_loss(y, memory, batch)
@@ -313,11 +315,13 @@ class Transformer1(nn.Module):
     # gen_or_copy_logprobs = self.gen_or_copy_predictor(decoder_output) # (B, T, 2)
     # assert not torch.isnan(gen_or_copy_logprobs).any()
 
+    batch_size = decoder_output.shape[0]
+
     # Calculate the loss of "Is the LLM generating the correct action"
     # Convert target embeddings to probability of taking each action in the vocab
     action_probs: torch.Tensor = self.tgt_lm_head(decoder_output)  # (B, T, C) where C = tgt_vocab_size
     # action_probs = action_probs.masked_fill(batch.action_mask.unsqueeze(-1) == 0, value=float("-inf"))
-    assert action_probs.shape == (BATCH_SIZE, TGT_SIZE, TGT_VOCAB_SIZE)
+    assert action_probs.shape == (batch_size, TGT_SIZE, TGT_VOCAB_SIZE)
     # Cross_entropy requires the "Class" dimension to be the 2nd dimension
     b, t, c = action_probs.shape
     action_probs = action_probs.view(b * t, c)
@@ -327,7 +331,7 @@ class Transformer1(nn.Module):
     # Do the cross entropy loss ourselves by gathering then logsoftmax
     # First: Use the value in the target action as indexes to gather the probabiity of that desired action from the action_probs tensor
     # target_action_prob = action_probs.gather(dim=2, index=batch.target.unsqueeze(-1)).squeeze(-1) # (B, T)
-    # assert target_action_prob.shape == (BATCH_SIZE, TGT_SIZE)
+    # assert target_action_prob.shape == (batch_size, TGT_SIZE)
     # print("HERE",target_action_prob)
     # loss_action = F.log_softmax(target_action_prob, dim=1) # (B, T)
     # assert not torch.isnan(loss_action).any()
@@ -336,9 +340,9 @@ class Transformer1(nn.Module):
     # Predict what primitive GenToken action to use at each time step
     primitive_probs: torch.Tensor = self.primitive_lm_head(decoder_output) # (B, T, 7)
     # primitive_probs.masked_fill(batch.copy_mask.unsqueeze(-1) == 0, value = float("-inf"))
-    assert primitive_probs.shape == (BATCH_SIZE, TGT_SIZE, PRIMITIVE_VOCAB_SIZE)
+    assert primitive_probs.shape == (batch_size, TGT_SIZE, PRIMITIVE_VOCAB_SIZE)
     # target_primitive_prob = primitive_probs.gather(dim=2, index=batch.primitive_seq.unsqueeze(-1)).squeeze(-1) # (B, T)
-    # assert target_primitive_prob.shape == (BATCH_SIZE, TGT_SIZE)
+    # assert target_primitive_prob.shape == (batch_size, TGT_SIZE)
     # loss_primitive = F.log_softmax(target_primitive_prob, dim=1) # (B, T)
 
     # Cross_entropy requires the "Class" dimension to be the 2nd dimension
@@ -359,11 +363,12 @@ class Transformer1(nn.Module):
 
   def encode(self, input_seq: torch.Tensor):
     # Input batch is of shape (B, T) (i.e. (batch size, block_size))
+    batch_size, block_size = input_seq.shape
     token_emb = self.encoder_token_emb(input_seq)  # (B, T, E) where E=emb_size
     # the position_embedding_table takes input the position of each token in the sequence (i.e. the T dimension)
     position_emb = self.positional_embedding_src  # (T, E)
     x = token_emb + position_emb  # (B, T, E)
-    assert x.shape == (BATCH_SIZE, BLOCK_SIZE, self.emb_size), f"Expected {(BATCH_SIZE, BLOCK_SIZE, self.emb_size)}. Got {x.shape}"
+    assert x.shape == (batch_size, block_size, self.emb_size), f"Expected {(batch_size, block_size, self.emb_size)}. Got {x.shape}"
     # Feed this x through layers of Transformer Self-Attention blocks
     x = self.encoder_layers(x)
     return x
@@ -374,29 +379,36 @@ class Transformer1(nn.Module):
 
   def generate(self, input_idx: torch.Tensor, max_generated_tokens: int = 45):
     with torch.no_grad():
-      predicted_tokens: list[list[int]] = [list() for _ in range(BATCH_SIZE)]  # Predicted token across the batches
+      # Initiate an ASDL parser
+      parse_res = self.transition_system.parse()
+      batch_size, _ = input_idx.shape
+      predicted_tokens: list[list[int]] = [list() for _ in range(batch_size)]  # Predicted token across the batches
       encoder_emb = self.encode(input_idx)
       # Feed the <START> token as the first chosen token to the entire batch
       # The <START> token has index 1
-      target_tokens = torch.ones((BATCH_SIZE, 1), device=DEVICE, dtype=torch.int64)  # (B)
-      field_tokens = torch.zeros((BATCH_SIZE, 1), device=DEVICE, dtype=torch.int64)
-      type_tokens = torch.zeros((BATCH_SIZE, 1), device=DEVICE, dtype=torch.int64) 
+      target_tokens = torch.ones((batch_size, 1), device=DEVICE, dtype=torch.int64)  # (B)
+      field_tokens = torch.zeros((batch_size, 1), device=DEVICE, dtype=torch.int64)
+      type_tokens = torch.zeros((batch_size, 1), device=DEVICE, dtype=torch.int64)
       target_tokens = torch.nn.functional.pad(target_tokens, (0, TGT_SIZE - target_tokens.size(1)), value=0)
       field_tokens = torch.nn.functional.pad(field_tokens, (0, TGT_SIZE - field_tokens.size(1)), value=0)
       type_tokens = torch.nn.functional.pad(type_tokens, (0, TGT_SIZE - type_tokens.size(1)), value=0)
       for i in range(max_generated_tokens):
-        assert target_tokens.shape == (BATCH_SIZE, TGT_SIZE), f"Expected {(BATCH_SIZE, TGT_SIZE)} got {target_tokens.shape}"
+        assert target_tokens.shape == (batch_size, TGT_SIZE), f"Expected {(batch_size, TGT_SIZE)} got {target_tokens.shape}"
         decoder_emb = self.decoder_token_emb(target_tokens)  # (B, T, E) where E=decoder_hidden_size
         position_emb = self.positional_embedding_tgt  # (T, E)
         field_emb = self.decoder_field_emb(field_tokens)
         type_emb = self.decoder_type_emb(type_tokens)
-        y = decoder_emb + position_emb
-        y = torch.cat((y, field_emb, type_emb), dim=-1)
-        assert y.shape == (BATCH_SIZE, TGT_SIZE, self.emb_size)
+        # Construct decoder_input
+        y = torch.cat((decoder_emb + position_emb, field_emb, type_emb), dim=-1)
+        assert y.shape == (batch_size, TGT_SIZE, self.emb_size)
+        # Pass through the decoder to get the hidden state
         y, _ = self.decoder_layers((y, encoder_emb))
-        tgt_probs = self.tgt_lm_head(y)  # (B, T, C) where C = tgt_vocab_size
-        tgt_probs_this_time_step = tgt_probs[:, i, :]  # (B, 1, C)
-        chosen_tokens = torch.argmax(tgt_probs_this_time_step, dim=-1)  # (B, 1)
+
+        # TODO: Use the transition_system to determine what valid actions are available
+        # Calculate probability of action
+        action_probs = self.tgt_lm_head(y)  # (B, T, C) where C = tgt_vocab_size
+        action_probs_this_time_step = action_probs[:, i, :]  # (B, 1, C)
+        chosen_tokens = torch.argmax(action_probs_this_time_step, dim=-1)  # (B, 1)
         if i < max_generated_tokens - 1:
           # Add the predicted tokens as new input target tokens to be used to generate next word
           # Note that in the last generatetion, we don't need to add the predicted tokens to the input any more
@@ -463,7 +475,7 @@ def estimate_loss(model: Transformer1, train_dataloader: DataLoader[DatasetItem]
 
 def main():
   # Train
-  MODEL_NAME = "transform7-tranx"
+  MODEL_NAME = "transform8-tranx"
 
   ts = SpiderTransitionSystem("grammars/Spider2.asdl", output_from=True)
 
@@ -474,7 +486,7 @@ def main():
 
   # Create a weight tensor for the cross entropy loss calculation of the action loss
   # i.e. every primitive_tokens should have weight 0 since they should not contribute to the action's cross entropy loss
-  action_loss_weight = torch.ones(TGT_VOCAB_SIZE, device=DEVICE)
+  action_loss_weight = torch.ones(TGT_VOCAB_SIZE)
   action_loss_weight[primitive_tokens] = 0 # Set the elements at the specified indexes to 0
 
   m1 = Transformer1(transition_system=ts, action_loss_weight=action_loss_weight)
@@ -529,6 +541,7 @@ def main():
     batch.field_idx = batch.field_idx.to(DEVICE)
     batch.type_idx = batch.type_idx.to(DEVICE)
     batch.primitive_seq = batch.primitive_seq.to(DEVICE)
+    
     _, loss = m1(batch)
     optimizer.zero_grad(set_to_none=True)
     loss.backward()
@@ -567,6 +580,7 @@ def main():
   m1_trained.eval()
 
   batch = next(train_dataloader_iter)
+  batch_size = batch.input.shape[0]
 
   y_batch = m1_trained.generate(batch.input.to(DEVICE), max_generated_tokens=TGT_SIZE)
 
@@ -580,7 +594,7 @@ def main():
 
   # Write result as txt
   with open(f"{MODEL_NAME}-result-{NOW.strftime('%y%m%d-%H%M')}.txt", "w") as f:
-    for i in range(BATCH_SIZE):
+    for i in range(batch_size):
       f.write(f"{i}\n")
       f.write(f"input_words: {vocabs.src_vocab.decode(batch.input[i, :].tolist())}\n")
       f.write(f"target_words: {vocabs.action_vocab.decode(batch.target[i, :].tolist())}\n")
