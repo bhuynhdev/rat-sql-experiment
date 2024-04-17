@@ -353,6 +353,17 @@ def classify_target_vocab(target_vocab: Vocab):
       primitive_tokens.append(target_vocab.encode([item])[0])
   return (actions_tokens, primitive_tokens)
 
+PRIMITIVE_TOK_TO_IDX = {
+  "None": 0,
+  "TablePrimitive": 1,
+  "ColumnPrimitive": 2,
+  "SingletonPrimitive": 3,
+  "StringPrimitive": 4,
+  "ObjectPrimitive": 5,
+  "IntPrimitive": 6,
+}
+
+PRIMITIVE_IDX_TO_TOK = { idx: tok for (tok, idx) in PRIMITIVE_TOK_TO_IDX.items() }
 
 class MyDataset(Dataset[DatasetItem]):
   """Each element in this dataset is a 4-element tuple
@@ -367,16 +378,6 @@ class MyDataset(Dataset[DatasetItem]):
     self.processed_items: list[DatasetItem] = []
     self.block_size = 0  # The maximum input sequence size
     self.target_size = 0  # The maximum target sequence size
-
-    PRIMITIVE_TOK_TO_IDX = {
-      "None": 0,
-      "TablePrimitive": 1,
-      "ColumnPrimitive": 2,
-      "SingletonPrimitive": 3,
-      "StringPrimitive": 4,
-      "ObjectPrimitive": 5,
-      "IntPrimitive": 6,
-    }
 
     for i, item in enumerate(all_items):
       # Encoder item preprocessing

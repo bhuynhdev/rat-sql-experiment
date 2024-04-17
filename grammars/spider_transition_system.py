@@ -3,7 +3,7 @@ from __future__ import absolute_import
 
 from dataclasses import dataclass
 from functools import total_ordering
-from typing import List, Generator, Tuple, Union, Optional, Type, Dict
+from typing import List, Generator, Tuple, Union, Optional, Type, Dict, Any
 import re
 
 from grammars.spider import SpiderGrammar
@@ -185,7 +185,6 @@ class SpiderTransitionSystem(TransitionSystem):
             raise ValueError
     else:
         return self.grammar[self.grammar.root_type]
-
 
   # def _tokenize(self, s: str) -> List[str]:
   #     # FIXME: dirty hack
@@ -416,9 +415,101 @@ def all_spider_gen_token_actions(
 def a2s(input):
   return "\n".join([repr(i) for i in input])
 
+class DecodeHypothesis(Hypothesis):
+  def __init__(self):
+      super(DecodeHypothesis, self).__init__()
+
+      self.action_infos = []
+      self.code = None
+
+  def clone_and_apply_action_info(self, action_info):
+      action = action_info.action
+
+      new_hyp = self.clone_and_apply_action(action)
+      new_hyp.action_infos.append(action_info)
+
+      return new_hyp
+
+  def copy(self):
+      new_hyp = DecodeHypothesis()
+      if self.tree:
+          new_hyp.tree = self.tree.copy()
+
+      new_hyp.actions = list(self.actions)
+      new_hyp.action_infos = list(self.action_infos)
+      new_hyp.score = self.score
+      new_hyp._value_buffer = list(self._value_buffer)
+      new_hyp.t = self.t
+      new_hyp.code = self.code
+
+      new_hyp.update_frontier_info()
+
+      return new_hyp
+  
+class ActionInfo(object):
+  """sufficient statistics for making a prediction of an action at a time step"""
+
+  def __init__(self, action=None):
+    self.t = 0
+    self.parent_t = -1
+    self.action = action
+    self.frontier_prod = None
+    self.frontier_field = None
+
+    # for GenToken actions only
+    self.copy_from_src = False
+    self.src_token_position = -1
+
+  def __repr__(self, verbose=False):
+    repr_str = '%s (t=%d, p_t=%d, frontier_field=%s)' % (repr(self.action),
+                                                         self.t,
+                                                         self.parent_t,
+                                                         self.frontier_field.__repr__(True) if self.frontier_field else 'None')
+
+    if verbose:
+      verbose_repr = 'action_prob=%.4f, ' % self.action_prob
+      if isinstance(self.action, SpiderGenTokenAction):
+        verbose_repr += 'in_vocab=%s, ' \
+                        'gen_copy_switch=%s, ' \
+                        'p(gen)=%s, p(copy)=%s, ' \
+                        'has_copy=%s, copy_pos=%s' % (self.in_vocab,
+                                                      self.gen_copy_switch,
+                                                      self.gen_token_prob, self.copy_token_prob,
+                                                      self.copy_from_src, self.src_token_position)
+
+      repr_str += '\n' + verbose_repr
+
+    return repr_str
+
+
+def get_action_infos(src_query, tgt_actions, force_copy=False):
+  action_infos = []
+  hyp = Hypothesis()
+  for t, action in enumerate(tgt_actions):
+    action_info = ActionInfo(action)
+    action_info.t = t
+    if hyp.frontier_node:
+      action_info.parent_t = hyp.frontier_node.created_time
+      action_info.frontier_prod = hyp.frontier_node.production
+      action_info.frontier_field = hyp.frontier_field.field
+
+    if isinstance(action, GenTokenAction):
+      try:
+        tok_src_idx = src_query.index(str(action.token))
+        action_info.copy_from_src = True
+        action_info.src_token_position = tok_src_idx
+      except ValueError:
+        if force_copy:
+          raise ValueError('cannot copy primitive token %s from source' % action.token)
+
+    hyp.apply_action(action)
+    action_infos.append(action_info)
+
+  return action_infos
+
 
 def main():
-  from preprocess import create_database_schemas, create_training_items
+  from preprocess import create_database_schemas, create_training_items, everything
   ts = SpiderTransitionSystem("grammars/Spider2.asdl", output_from=True)
   # # print("FIELDS\n", a2s(ts.grammar.fields))
   # gen_tok_acts = [ts.get_gen_token_action(a)(num) for a in ts.grammar.primitive_types for num in range(10)]
@@ -428,34 +519,7 @@ def main():
   # _, _, train_items, _ = create_training_items(
   #   "spider/train_spider.json", "spider/dev.json", schema_lookup
   # )
-  h = Hypothesis()
-  hs = [h]
-  new_hyp_meta = []
-  for h_id, hyp in enumerate(hs):
-    action_types = ts.get_valid_continuation_types(hyp)
-    for action_type in action_types:
-      if action_type == ApplyRuleAction:
-          productions = ts.get_valid_continuating_productions(hyp)
-          for production in productions:
-              # Convert production to token id
-              prod_id = ts.grammar.prod2id[production]
-              prod_score = 0.12
-              new_hyp_score = hyp.score + prod_score
-
-              meta_entry = {'action_type': 'apply_rule', 'prod_id': prod_id,
-                            'score': prod_score, 'new_hyp_score': new_hyp_score,
-                            'prev_hyp_id': h_id}
-              new_hyp_meta.append(meta_entry)
-      elif action_type == ReduceAction:
-          action_score = 0.25
-          new_hyp_score = hyp.score + action_score
-
-          meta_entry = {'action_type': 'apply_rule', 'prod_id': 5000,
-                        'score': action_score, 'new_hyp_score': new_hyp_score,
-                        'prev_hyp_id': h_id}
-          new_hyp_meta.append(meta_entry)
-
-  print(new_hyp_meta)
+  _, _, _, _, vocabs = everything()
 
 
 if __name__ == "__main__":
