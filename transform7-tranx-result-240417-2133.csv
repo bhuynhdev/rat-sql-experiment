@@ -1,0 +1,25 @@
+match_percentage,nl_question,sql_target
+0.11518324607329843,Return the number of likes that the high schooler named Kyle has.,"SELECT count(*) FROM Likes AS T1 JOIN Highschooler AS T2 ON T1.student_id  =  T2.id WHERE T2.name  =  ""Kyle"""
+0.1099476439790576,How many high schoolers are there in grade 9 or 10?,SELECT count(*) FROM Highschooler WHERE grade  =  9 OR grade  =  10
+0.07329842931937172,What are the average and maximum number of tickets bought in all visits?,"SELECT avg(num_of_ticket) ,  max(num_of_ticket) FROM visit"
+0.03664921465968586,Find the name of tourney that has more than 10 matches.,SELECT tourney_name FROM matches GROUP BY tourney_name HAVING count(*)  >  10
+0.11518324607329843,Show the names of conductors and the orchestras they have conducted.,"SELECT T1.Name ,  T2.Orchestra FROM conductor AS T1 JOIN orchestra AS T2 ON T1.Conductor_ID  =  T2.Conductor_ID"
+0.18324607329842932,Find the model of the car whose weight is below the average weight.,SELECT T1.model FROM CAR_NAMES AS T1 JOIN CARS_DATA AS T2 ON T1.MakeId  =  T2.Id WHERE T2.Weight  <  (SELECT avg(Weight) FROM CARS_DATA)
+0.2513089005235602,What are the country code and first name of the players who won in both tourney WTA Championships and Australian Open?,"SELECT T1.country_code ,  T1.first_name FROM players AS T1 JOIN matches AS T2 ON T1.player_id  =  T2.winner_id WHERE T2.tourney_name  =  'WTA Championships' INTERSECT SELECT T1.country_code ,  T1.first_name FROM players AS T1 JOIN matches AS T2 ON T1.player_id  =  T2.winner_id WHERE T2.tourney_name  =  'Australian Open'"
+0.23036649214659685,Find the number of visitors who did not visit any museum opened after 2010.,SELECT count(*) FROM visitor WHERE id NOT IN (SELECT t2.visitor_id FROM museum AS t1 JOIN visit AS t2 ON t1.Museum_ID  =  t2.Museum_ID WHERE t1.open_year  >  2010)
+0.13089005235602094,What are airlines that have some flight departing from airport 'AHD'?,"SELECT T1.Airline FROM AIRLINES AS T1 JOIN FLIGHTS AS T2 ON T1.uid  =  T2.Airline WHERE T2.SourceAirport  =  ""AHD"""
+0.10471204188481675,"What is the average, minimum, and maximum age for all French singers?","SELECT avg(age) ,  min(age) ,  max(age) FROM singer WHERE country  =  'France'"
+0.15706806282722513,Show names of teachers and the courses they are arranged to teach in ascending alphabetical order of the teacher's name.,"SELECT T3.Name ,  T2.Course FROM course_arrange AS T1 JOIN course AS T2 ON T1.Course_ID  =  T2.Course_ID JOIN teacher AS T3 ON T1.Teacher_ID  =  T3.Teacher_ID ORDER BY T3.Name"
+0.11518324607329843,What is the name of the course with the most students enrolled?,SELECT  T1.course_name FROM Courses AS T1 JOIN Student_Enrolment_Courses AS T2 ON T1.course_id  =  T2.course_id GROUP BY T1.course_name ORDER BY count(*) DESC LIMIT 1
+0.08376963350785341,List all document ids with at least two paragraphs.,SELECT document_id FROM Paragraphs GROUP BY document_id HAVING count(*)  >=  2
+0.10471204188481675,What are the names of the teachers ordered by ascending age?,SELECT Name FROM teacher ORDER BY Age ASC
+0.14136125654450263,What are the Asian countries which have a population larger than that of any country in Africa?,"SELECT Name FROM country WHERE Continent  =  ""Asia""  AND population  >  (SELECT min(population) FROM country WHERE Continent  =  ""Africa"")"
+0.08376963350785341,What is the code of the country with the most players?,SELECT country_code FROM players GROUP BY country_code ORDER BY count(*) DESC LIMIT 1
+0.12041884816753927,What is the first name and gender of the all the students who have more than one pet?,"SELECT T1.fname ,  T1.sex FROM student AS T1 JOIN has_pet AS T2 ON T1.stuid  =  T2.stuid GROUP BY T1.stuid HAVING count(*)  >  1"
+0.2198952879581152,What are the names of nations where both English and French are official languages?,"SELECT T1.Name FROM country AS T1 JOIN countrylanguage AS T2 ON T1.Code  =  T2.CountryCode WHERE T2.Language  =  ""English"" AND T2.IsOfficial  =  ""T"" INTERSECT SELECT T1.Name FROM country AS T1 JOIN countrylanguage AS T2 ON T1.Code  =  T2.CountryCode WHERE T2.Language  =  ""French"" AND T2.IsOfficial  =  ""T"""
+0.09424083769633508,How many type of governments are in Africa?,"SELECT count(DISTINCT GovernmentForm) FROM country WHERE Continent  =  ""Africa"""
+0.06282722513089005,List the name of the conductor with the most years of work.,SELECT Name FROM conductor ORDER BY Year_of_Work DESC LIMIT 1
+0.13612565445026178,How many professionals did not operate any treatment on dogs?,SELECT count(*) FROM Professionals WHERE professional_id NOT IN ( SELECT professional_id FROM Treatments )
+0.13089005235602094,List the names and birth dates of people in ascending alphabetical order of name.,"SELECT Name ,  Birth_Date FROM people ORDER BY Name ASC"
+0.06282722513089005,Compute the average age of all the dogs.,SELECT avg(age) FROM Dogs
+0.13612565445026178,What is the mobile phone number of the student named Timmothy Ward ?,select cell_mobile_number from students where first_name  =  'timmothy' and last_name  =  'ward'

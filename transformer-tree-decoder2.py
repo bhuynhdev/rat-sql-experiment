@@ -1,7 +1,7 @@
 import math
 import os
 from datetime import datetime
-
+import csv
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
@@ -589,6 +589,66 @@ def main():
       f.write(f"predicted_tokens: {y_batch[i]}\n")
 
 
+def evaluate():
+  ts = SpiderTransitionSystem("grammars/Spider2.asdl", output_from=True)
+
+  print("BOOTSTRAPPING THE DATALOADER")
+  train_dataset, val_dataset, train_dataloader, val_dataloader, vocabs = preprocess.everything()
+
+  _, primitive_tokens = preprocess.classify_target_vocab(vocabs.action_vocab)
+
+  # Create a weight tensor for the cross entropy loss calculation of the action loss
+  # i.e. every primitive_tokens should have weight 0 since they should not contribute to the action's cross entropy loss
+  action_loss_weight = torch.ones(TGT_VOCAB_SIZE, device=DEVICE)
+  action_loss_weight[primitive_tokens] = 0 # Set the elements at the specified indexes to 0
+
+  MODEL_NAME = "transform7-tranx"
+  m1_trained = Transformer1(transition_system=ts, action_loss_weight=action_loss_weight)
+  m1_trained = m1_trained.to(DEVICE)
+  saved_state = torch.load(f"{MODEL_NAME}.pt") # pyright: ignore[reportUnknownMemberType]
+  m1_trained.load_state_dict(saved_state["state_dict"]) 
+  m1_trained.eval()
+
+  val_dataloader_iter = iter(val_dataloader)
+  batch = next(val_dataloader_iter)
+
+  y_batch = m1_trained.generate(batch.input.to(DEVICE), max_generated_tokens=TGT_SIZE)
+
+  # Write result as txt
+  NOW = datetime.now()
+  matches: list[float] = []
+  data_to_record: list[dict[str, float | str]] = []
+  with open(f"{MODEL_NAME}-result-{NOW.strftime('%y%m%d-%H%M')}.txt", "w") as f:
+    for i in range(batch.input.size(0)):
+      # f.write(f"{i}\n")
+      spider_item = val_dataset.items[int(batch.id[i].item())]
+      target_tokens = batch.target[i, :].tolist()
+      # f.write(f"input_words: {vocabs.src_vocab.decode(batch.input[i, :].tolist())}\n")
+      # f.write(f"target_words: {vocabs.action_vocab.decode(batch.target[i, :].tolist())}\n")
+      # f.write(f"target_tokens: {batch.target[i, :].tolist()}\n")
+      # f.write(f"predicted_words: {vocabs.action_vocab.decode(y_batch[i])}\n")
+      # f.write(f"predicted_tokens: {y_batch[i]}\n")
+
+      # Calculate how much the prediction matches the target word-by-word
+      match_count = 0
+      for predicted, target in zip(y_batch[i], target_tokens):
+        if target == vocabs.action_vocab.encode(["<END>"])[0]:
+          break
+        if predicted == target:
+          match_count += 1
+      matches.append(match_count / TGT_SIZE)
+      data_to_record.append({"match_percentage": match_count / TGT_SIZE, "nl_question": spider_item.qa_pair.question, "sql_target": spider_item.qa_pair.query})
+
+  with open(f"{MODEL_NAME}-result-{NOW.strftime('%y%m%d-%H%M')}.csv", "w") as csvfile:
+    fieldnames = list(data_to_record[0].keys()) if data_to_record else []
+    writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+    
+    # Write header row
+    writer.writeheader()
+    
+    # Write each dictionary as a row
+    for row in data_to_record:
+        writer.writerow(row)
 
 if __name__ == "__main__":
-  main()
+  evaluate()

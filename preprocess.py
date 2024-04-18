@@ -378,6 +378,7 @@ class MyDataset(Dataset[DatasetItem]):
     self.processed_items: list[DatasetItem] = []
     self.block_size = 0  # The maximum input sequence size
     self.target_size = 0  # The maximum target sequence size
+    self.items = all_items
 
     for i, item in enumerate(all_items):
       # Encoder item preprocessing
